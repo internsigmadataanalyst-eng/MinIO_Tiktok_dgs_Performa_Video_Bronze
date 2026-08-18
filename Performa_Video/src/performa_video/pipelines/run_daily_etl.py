@@ -73,7 +73,7 @@ def run_daily_etl():
             "build_fn": build_bronze_video,
             "raw_df": df_tt_vid_raw,
             "id_col": "tanggal",
-            "date_col": "tanggal",
+            "date_cols": ["tanggal", "waktu"],
             "numeric_cols": NUMERIC_COLS,
             "percent_cols": PERCENT_COLS,
             "file_path": f"performa/video/date={today_key}/video_{run_key}.parquet",
@@ -85,7 +85,7 @@ def run_daily_etl():
             "build_fn": build_bronze_produksi,
             "raw_df": df_tt_prod_raw,
             "id_col": "id_konten",
-            "date_col": "tanggal",
+            "date_cols": ["tanggal", "tanggal_jadi"],
             "numeric_cols": [],
             "percent_cols": None,
             "file_path": f"produksi/date={today_key}/produksi_{run_key}.parquet",
@@ -115,11 +115,15 @@ def run_daily_etl():
         df_raw = cfg["raw_df"]
         df_raw = df_raw[df_raw[key_col].astype(str).str.strip() != ""]
 
-        date_col = next(
-            c for c in df_raw.columns if to_snake_case(str(c)) == cfg["date_col"]
-        )
+        date_cols = [
+            next(
+                c for c in df_raw.columns if to_snake_case(str(c)) == dc
+            )
+            for dc in cfg["date_cols"]
+        ]
+        date_col = date_cols[0] if date_cols else None
         df_valid, df_error, v_report = validate_and_normalize_raw(
-            df_raw, cfg["numeric_cols"], percent_cols=cfg["percent_cols"], date_col=date_col
+            df_raw, cfg["numeric_cols"], percent_cols=cfg["percent_cols"], date_cols=date_cols
         )
         print(
             f"[VALIDATE] Rows valid: {len(df_valid)} | bad rows: {v_report['n_bad_rows']} "

@@ -202,28 +202,44 @@ def detect_numeric_corruption(
 
 
 def validate_and_normalize_raw(
-    df: pd.DataFrame, numeric_cols, date_col: str = "Tanggal", percent_cols: list = None
+    df: pd.DataFrame, numeric_cols, date_cols: List[str] = None, percent_cols: list = None
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """STEP 2: row-level validation & normalization.
 
     - Detects mixed/corrupted cells in numeric columns (main filter) and, when
       given, in percentage/rate columns (percent_cols).
-    - Parses mixed dates; rows with NaT are captured as date-error rows.
+    - Parses mixed dates in EVERY column in date_cols; rows with NaT are
+      captured as date-error rows. For the primary (first) date column a blank
+      value is also an error; for secondary date columns only non-empty
+      unparsable values are errors (blank secondary dates stay valid).
     - Splits into (df_valid, df_error, report). df_error keeps the ORIGINAL raw
       values plus an error_reason column; df_valid is cleaned for downstream.
     """
     df = df.copy()
 
+    if date_cols is None:
+        date_cols = ["Tanggal"]
+
     blank_mask = detect_blank_rows(df)
 
     corruption = detect_numeric_corruption(
-        df, numeric_cols, percent_cols=percent_cols, date_col=date_col
+        df, numeric_cols, percent_cols=percent_cols, date_col=date_cols[0] if date_cols else "Tanggal"
     )
     df_clean = clean_numeric_columns(df, numeric_cols, fillna_value=0)
 
-    parsed = parse_mixed_dates(df_clean[date_col], return_date=False)
-    df_clean[date_col] = parsed
-    date_error = parsed.isna()
+    date_error = pd.Series(False, index=df.index)
+    for i, col in enumerate(date_cols):
+        if col not in df_clean.columns:
+            continue
+
+        parsed = parse_mixed_dates(df_clean[col], return_date=False)
+        df_clean[col] = parsed
+
+        if i == 0:
+            date_error = parsed.isna()
+        else:
+            raw = df[col].astype(str).str.strip()
+            date_error = date_error | (parsed.isna() & _is_non_empty(raw))
 
     error_mask = (corruption["affected_mask"] | date_error) & ~blank_mask
 
