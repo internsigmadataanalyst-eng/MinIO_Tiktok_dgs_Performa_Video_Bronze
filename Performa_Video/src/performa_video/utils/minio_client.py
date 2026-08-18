@@ -207,11 +207,21 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
         cr_col = "creds" if "creds" in df_error.columns else sn_col
 
         for (sheet_name, creds, error_date), idx in df_error.groupby([sn_col, cr_col, "_error_date"]).groups.items():
+            bad_vals = set()
+            for col in report["affected_columns"]:
+                if col not in df_error.columns:
+                    continue
+                vals = df_error.loc[idx, col].astype(str).str.strip()
+                bad_vals.update(
+                    v for v in vals
+                    if v and v.lower() not in ("nan", "none", "-", "n/a", "nat")
+                )
             current_entries.append({
                 "sheet_name": str(sheet_name),
                 "creds": str(creds),
                 "error_date": str(error_date),
                 "affected_columns": list(report["affected_columns"]),
+                "bad_values": sorted(bad_vals),
                 "n_rows": int(len(idx)),
                 "reported_at": now,
                 "path": quarantine_path,

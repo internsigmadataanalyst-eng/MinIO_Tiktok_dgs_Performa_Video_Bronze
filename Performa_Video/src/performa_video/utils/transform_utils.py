@@ -228,6 +228,7 @@ def validate_and_normalize_raw(
     df_clean = clean_numeric_columns(df, numeric_cols, fillna_value=0)
 
     date_error = pd.Series(False, index=df.index)
+    date_fail_cols: dict = {idx: [] for idx in df.index}
     for i, col in enumerate(date_cols):
         if col not in df_clean.columns:
             continue
@@ -236,10 +237,14 @@ def validate_and_normalize_raw(
         df_clean[col] = parsed
 
         if i == 0:
-            date_error = parsed.isna()
+            this_err = parsed.isna()
         else:
             raw = df[col].astype(str).str.strip()
-            date_error = date_error | (parsed.isna() & _is_non_empty(raw))
+            this_err = parsed.isna() & _is_non_empty(raw)
+
+        date_error = date_error | this_err
+        for idx in df.index[this_err]:
+            date_fail_cols[idx].append(col)
 
     error_mask = (corruption["affected_mask"] | date_error) & ~blank_mask
 
@@ -249,16 +254,23 @@ def validate_and_normalize_raw(
         reason_parts = []
         if corruption["affected_mask"].loc[idx]:
             reason_parts.append("numeric_mixed")
-        if date_error.loc[idx]:
-            reason_parts.append("date_unparsable")
+        for col in date_fail_cols[idx]:
+            raw_val = str(df.loc[idx, col])
+            reason_parts.append(f"date_unparsable({col}={raw_val})")
         reasons.append("|".join(reason_parts))
     df_error["error_reason"] = reasons
 
     df_valid = df_clean[~(error_mask | blank_mask)].copy()
 
+    affected_cols = list(corruption["affected_columns"])
+    for col in date_fail_cols.values():
+        for c in col:
+            if c not in affected_cols:
+                affected_cols.append(c)
+
     report = {
         "has_changes": bool(error_mask.any()),
-        "affected_columns": corruption["affected_columns"],
+        "affected_columns": affected_cols,
         "first_affected_date": corruption["first_affected_date"],
         "last_affected_date": corruption["last_affected_date"],
         "affected_dates": corruption["affected_dates"],
