@@ -1,0 +1,23 @@
+SELECT
+  id_video,
+  toko,
+  tanggal,
+  nama_kreator,
+  id_kreator,
+  informasi_video,
+  waktu,
+  produk AS produk_sku,
+  vv AS views,
+  likes,
+  komentar,
+  dibagikan,
+  pengikut_baru,
+  klik_video_ke_live,
+  produk_dilihat,
+  klik_produk,
+  pembeli,
+  pesanan_video,
+  produk_terjual_video,
+  gmv_bruto_video,
+  gmv_didapat_video
+FROM `database-sigma.SILVER_DB.silver_tt_video`

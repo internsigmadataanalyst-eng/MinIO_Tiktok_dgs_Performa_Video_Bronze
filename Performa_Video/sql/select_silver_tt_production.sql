@@ -1,0 +1,25 @@
+SELECT
+  id_konten AS id_video,
+  tanggal AS tanggal_production,
+  scripter,
+  editor,
+  akun,
+  produk,
+  jenis_konten,
+  tipe_konten,
+  talent_visual,
+  kategori_konten,
+  isu,
+  layout,
+  script,
+  brief_editing,
+  cta,
+  talent_vo,
+  referensi_musik,
+  sound,
+  visual_hook,
+  audio_hook,
+  progress_edit,
+  link_konten
+
+FROM `database-sigma.SILVER_DB.silver_tt_video_production`
