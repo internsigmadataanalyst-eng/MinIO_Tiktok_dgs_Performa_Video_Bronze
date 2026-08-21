@@ -25,6 +25,16 @@ DROP_COLS_PRODUKSI = [
     "bulan",
 ]
 
+DROP_COLS_VIDEO = [
+    "pesanan_sku_dari_video",
+    "pesanan_sku_tidak_langsung_dari_video",
+    "produk_yang_terjual_dari_video_kolom_baru",
+    "produk_yang_terjual_dari_video_secara_tidak_langsung",
+    "gmv_video_rp",
+    "gmv_tidak_langsung_dari_video_rp",
+    "diagnosis"
+]
+
 def _canon(x):
     import pandas as pd
 
@@ -60,7 +70,7 @@ def build_bronze_video(
     df = df[df["tanggal"].astype(str).str.strip() != ""]
 
     # Drop kolom-kolom yang tidak diperlukan sebelum dikirim ke Minio
-    df = df.drop(columns=DROP_COLS_PRODUKSI, errors="ignore")
+    df = df.drop(columns=DROP_COLS_VIDEO, errors="ignore")
 
     # Replace empty strings dengan None di kolom berjenis object/string
     for col in df.select_dtypes(include="object").columns:
@@ -145,6 +155,9 @@ def build_bronze_produksi(
     df["tanggal_jadi"] = parse_mixed_dates(
         df["tanggal_jadi"], return_date=False
     )
+
+    # Drop kolom-kolom yang tidak diperlukan sebelum dikirim ke Minio
+    df = df.drop(columns=DROP_COLS_PRODUKSI, errors="ignore")
 
     # snapshot fields
     now_utc = datetime.now(timezone.utc)

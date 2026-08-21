@@ -22,4 +22,4 @@ SELECT
   progress_edit,
   link_konten
 
-FROM `database-sigma.SILVER_DB.silver_tt_video_production`
+FROM `database-sigma.Testing.silver_tt_video_production`

@@ -20,4 +20,4 @@ SELECT
   produk_terjual_video,
   gmv_bruto_video,
   gmv_didapat_video
-FROM `database-sigma.SILVER_DB.silver_tt_video`
+FROM `database-sigma.Testing.silver_tt_video`

@@ -4,6 +4,8 @@ import io
 import os
 from datetime import date
 
+import pandas as pd
+
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 
@@ -15,10 +17,19 @@ from src.performa_video.ingestion.fetch_performa_video_gsheet import (
     fetch_tiktok_video,
     SHEET_REGISTRY,
 )
+from src.performa_video.load.load_to_bigquery import load_df
 from src.performa_video.transform.clean_bronze import (
     build_bronze_produksi,
     build_bronze_video,
 )
+
+from src.performa_video.transform.merge_silver import (
+    merge_to_silver_video,
+    merge_to_silver_production
+)
+from src.performa_video.transform.build_gold import build_fact_performa_video
+from src.performa_video.load.load_to_bigquery import load_df
+
 from src.performa_video.utils.bq_client import get_bq_client
 from src.performa_video.utils.gsheet_client import get_gspread_client
 from src.performa_video.utils.minio_client import (
@@ -43,6 +54,67 @@ def _get_credentials():
     if not sa_path:
         raise RuntimeError("Env GOOGLE_APPLICATION_CREDENTIALS belum di-set")
     return service_account.Credentials.from_service_account_file(sa_path)
+
+
+def _select_recovered(
+    df_valid: pd.DataFrame, resolved: list, report: dict, date_col: str = "Tanggal"
+) -> pd.DataFrame:
+    """PATH A: select rows from df_valid that were recovered from a resolved error.
+
+    A resolved entry (sheet_name, creds, error_date) means the key was in the
+    error manifest last run but is NO LONGER in df_error this run (the data
+    got fixed). Those rows bypass the watermark filter downstream.
+
+    Full recovery only: we include the key's rows ONLY when the number of
+    valid rows now equals the manifest n_rows. Otherwise the group is either
+    only partially fixed (some rows still bad -> entry stays open) or extra
+    rows appeared on that historical date. Skipping avoids duplicates and
+    partial/incorrect recovery; the data is never silently lost because the
+    entry remains "open" and will be retried on a later run.
+
+    Counters are added to `report`:
+      recovery_resolved        : resolved keys considered
+      recovery_recovered_rows  : rows selected for Path A
+      recovery_count_mismatch  : keys fixed but row_count != n_rows (skipped)
+      recovery_absent          : resolved keys with no matching rows (deleted)
+    """
+    df = df_valid.copy()
+
+    if df.empty or not resolved:
+        report.setdefault("recovery_resolved", 0)
+        report.setdefault("recovery_recovered_rows", 0)
+        report.setdefault("recovery_count_mismatch", 0)
+        report.setdefault("recovery_absent", 0)
+        return df.iloc[0:0]
+
+    key_series = (
+        df["sheet_name"].astype(str)
+        + "|" + df["creds"].astype(str)
+        + "|" + df[date_col].dt.date.astype(str)
+    )
+
+    match = pd.Series(False, index=df.index)
+    count_mismatch = 0
+    absent = 0
+
+    for r in resolved:
+        key = f'{r["sheet_name"]}|{r["creds"]}|{r["error_date"]}'
+        grp = df.index[key_series == key]
+        n_expected = int(r.get("n_rows") or 0)
+
+        if len(grp) == 0:
+            absent += 1                      # rows removed from sheet
+        elif len(grp) == n_expected:
+            match.loc[grp] = True            # fully recovered -> Path A
+        else:
+            count_mismatch += 1              # FIXED but count mismatch -> skip
+
+    report["recovery_resolved"] = len(resolved)
+    report["recovery_recovered_rows"] = int(match.sum())
+    report["recovery_count_mismatch"] = count_mismatch
+    report["recovery_absent"] = absent
+
+    return df[match]
 
 
 def run_daily_etl():
@@ -80,6 +152,7 @@ def run_daily_etl():
             "watermark_path": "watermarks/performa_video.json",
             "manifest_path": "error_list_watermark/video/error_manifest.json",
             "fix_prefix": "fix_error_list_watermark/video",
+            "bq_table_id": "Testing.bronze_video",
         },
         "produksi": {
             "build_fn": build_bronze_produksi,
@@ -92,6 +165,7 @@ def run_daily_etl():
             "watermark_path": "watermarks/produksi.json",
             "manifest_path": "error_list_watermark/produksi/error_manifest.json",
             "fix_prefix": "fix_error_list_watermark/produksi",
+            "bq_table_id": "Testing.bronze_video_production",
         },
     }
 
@@ -138,7 +212,8 @@ def run_daily_etl():
 
         # STEP 3Q/6: sync error manifest EVERY run (append new open entries +
         # resolve entries whose format has been fixed since the last run).
-        sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, subfolder=name, manifest_path=cfg["manifest_path"], fix_prefix=cfg["fix_prefix"], date_col=date_col)
+        # Resolved entries feed PATH A (error recovery) below.
+        resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, subfolder=name, manifest_path=cfg["manifest_path"], fix_prefix=cfg["fix_prefix"], date_col=date_col, df_valid=df_valid)
 
         if not df_error.empty:
             write_quarantine(minio_client, minio_bucket, df_error, today_key, run_key, subfolder=name)
@@ -149,10 +224,31 @@ def run_daily_etl():
             minio_client, minio_bucket, watermark_path, sheet_registry=sheet_registry
         )
 
-        # Bronze: cleaning + per-sheet incremental filter
-        df_filtered, sheet_max_dates = cfg["build_fn"](
-            df_valid, sheet_watermarks=watermark_map
+        # PATH A: recovered rows (fixed since last run) bypass the watermark.
+        df_recovered = _select_recovered(df_valid, resolved, v_report, date_col)
+        print(
+            f"[RECOVERY][{name}] resolved={v_report.get('recovery_resolved', 0)} "
+            f"| recovered_rows={v_report.get('recovery_recovered_rows', 0)} "
+            f"| absent={v_report.get('recovery_absent', 0)} "
+            f"| count_mismatch_skipped={v_report.get('recovery_count_mismatch', 0)}"
         )
+
+        # PATH B: remaining rows use the standard per-sheet watermark filter.
+        df_regular = df_valid.drop(df_recovered.index)
+        df_filtered, sheet_max_dates = cfg["build_fn"](
+            df_regular, sheet_watermarks=watermark_map
+        )
+
+        # PATH A transform: empty watermarks = full load, max dates discarded.
+        if df_recovered.empty:
+            df_recovered_bronze = df_filtered.iloc[0:0]
+        else:
+            df_recovered_bronze, _ = cfg["build_fn"](df_recovered, sheet_watermarks={})
+
+        # MERGE & DEDUPLICATE
+        df_filtered = pd.concat(
+            [df_filtered, df_recovered_bronze], ignore_index=True
+        ).drop_duplicates(subset=["row_hash_raw"])
         print(f"[BRONZE] Rows bronze {name} to load: {len(df_filtered)}")
 
         if df_filtered.empty:
@@ -174,11 +270,42 @@ def run_daily_etl():
         )
         print(f"[MINIO] Successfully Loaded {name} to: {file_path}")
 
+        # Load bronze ke BigQuery (per dataset)
+        load_df(
+            df_filtered,
+            table_id=cfg["bq_table_id"],
+            project_id=PROJECT_ID,
+            if_exists="append",
+            credentials=creds,
+        )
+        print(f"[BRONZE] Load to {cfg['bq_table_id']} DONE")
+
         # Update per-sheet watermark masing-masing dataset (selalu tulis format baru)
         update_sheet_watermarks(
             minio_client, minio_bucket, watermark_path, watermark_records, sheet_max_dates,
             sheet_registry=sheet_registry,
         )
+
+    # 4) Silver: MERGE
+    print("[SILVER] Running MERGE into SILVER_DB.silver_tt_video ...")
+    merge_to_silver_video()
+    print("[SILVER] MERGE VIDEO DONE")
+    merge_to_silver_production()
+    print("[SILVER] MERGE PRODUCTION DONE")
+
+    # 5) Gold: fact_performa_video_daily
+    print("[GOLD] Building fact_performa_video_daily ...")
+    df_fact = build_fact_performa_video(bq_client)
+    print(f"[GOLD] Rows fact_performa_video_daily: {len(df_fact)}")
+
+    load_df(
+        df_fact,
+        table_id="Testing.fact_video_performa_daily",
+        project_id=PROJECT_ID,
+        if_exists="replace",  # nanti bisa jadi MERGE kalau mau incremental
+        credentials=creds,
+    )
+    print("[GOLD] Load to GOLD_DB.fact_video_performa_daily DONE")
 
     print("\n== ETL Performa Video DONE ==")
 

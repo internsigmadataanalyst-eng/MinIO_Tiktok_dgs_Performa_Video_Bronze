@@ -1,4 +1,4 @@
-MERGE `database-sigma.SILVER_DB.silver_tt_video` T
+MERGE `database-sigma.Testing.silver_tt_video` T
 USING (
   -- ambil snapshot terbaru per (toko, id_kreator, id_video, tanggal)
   WITH latest_raw AS (
@@ -11,7 +11,7 @@ USING (
                             DATE(b.tanggal)
                ORDER BY b.snapshot_ts DESC, b.run_id DESC
              ) rn
-      FROM `database-sigma.BRONZE_DB.bronze_video` b
+      FROM `database-sigma.Testing.bronze_video` b
     )
     WHERE rn = 1
   ),
