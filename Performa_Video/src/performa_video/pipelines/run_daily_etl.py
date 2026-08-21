@@ -27,7 +27,7 @@ from src.performa_video.transform.merge_silver import (
     merge_to_silver_video,
     merge_to_silver_production
 )
-from src.performa_video.transform.build_gold import build_fact_performa_video
+from src.performa_video.transform.create_gold import create_gold_fact_video_performa_daily
 from src.performa_video.load.load_to_bigquery import load_df
 
 from src.performa_video.utils.bq_client import get_bq_client
@@ -295,16 +295,7 @@ def run_daily_etl():
 
     # 5) Gold: fact_performa_video_daily
     print("[GOLD] Building fact_performa_video_daily ...")
-    df_fact = build_fact_performa_video(bq_client)
-    print(f"[GOLD] Rows fact_performa_video_daily: {len(df_fact)}")
-
-    load_df(
-        df_fact,
-        table_id="Testing.fact_video_performa_daily",
-        project_id=PROJECT_ID,
-        if_exists="replace",  # nanti bisa jadi MERGE kalau mau incremental
-        credentials=creds,
-    )
+    create_gold_fact_video_performa_daily()
     print("[GOLD] Load to GOLD_DB.fact_video_performa_daily DONE")
 
     print("\n== ETL Performa Video DONE ==")
