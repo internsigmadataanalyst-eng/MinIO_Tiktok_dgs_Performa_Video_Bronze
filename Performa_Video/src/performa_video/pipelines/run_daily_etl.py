@@ -28,14 +28,13 @@ from src.performa_video.transform.merge_silver import (
     merge_to_silver_production
 )
 from src.performa_video.transform.create_gold import create_gold_fact_video_performa_daily
-from src.performa_video.load.load_to_bigquery import load_df
 
-from src.performa_video.utils.bq_client import get_bq_client
 from src.performa_video.utils.gsheet_client import get_gspread_client
 from src.performa_video.utils.minio_client import (
     get_minio_client,
     get_sheet_watermarks,
     update_sheet_watermarks,
+    filter_already_quarantined,
     write_quarantine,
     sync_error_manifest,
 )
@@ -122,7 +121,6 @@ def run_daily_etl():
 
     # 1) Client
     gc = get_gspread_client()
-    bq_client = get_bq_client()
     creds = _get_credentials()
     minio_client, minio_bucket = get_minio_client()
 
@@ -219,9 +217,8 @@ def run_daily_etl():
             write_quarantine(minio_client, minio_bucket, df_error, today_key, run_key, subfolder=name)
 
         # Get per-sheet watermark spesifik untuk dataset ini
-        # sheet_registry hanya dibutuhkan utk FAILSAFE migrasi format lama (sheet_name -> creds).
         watermark_map, watermark_records = get_sheet_watermarks(
-            minio_client, minio_bucket, watermark_path, sheet_registry=sheet_registry
+            minio_client, minio_bucket, watermark_path
         )
 
         # PATH A: recovered rows (fixed since last run) bypass the watermark.
@@ -280,10 +277,9 @@ def run_daily_etl():
         )
         print(f"[BRONZE] Load to {cfg['bq_table_id']} DONE")
 
-        # Update per-sheet watermark masing-masing dataset (selalu tulis format baru)
+        # Update per-sheet watermark masing-masing dataset
         update_sheet_watermarks(
             minio_client, minio_bucket, watermark_path, watermark_records, sheet_max_dates,
-            sheet_registry=sheet_registry,
         )
 
     # 4) Silver: MERGE
