@@ -1,4 +1,4 @@
-MERGE `database-sigma.Testing.silver_tt_video_production` T
+MERGE `database-sigma.SILVER_DB.silver_tt_video_production` T
 USING (
   -- 1) Ambil snapshot terbaru per (akun, id_konten, tanggal_harian)
   WITH latest_raw AS (
@@ -11,7 +11,7 @@ USING (
                  DATETIME_TRUNC(CAST(b.tanggal AS DATETIME), DAY)
                ORDER BY b.snapshot_ts DESC, b.run_id DESC
              ) rn
-      FROM `database-sigma.Testing.bronze_video_production` b
+      FROM `database-sigma.BRONZE_DB.bronze_video_production` b
     )
     WHERE rn = 1
   ),

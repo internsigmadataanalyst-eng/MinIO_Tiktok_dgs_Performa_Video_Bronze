@@ -1,4 +1,4 @@
-CREATE OR REPLACE TABLE `database-sigma.Testing.fact_video_performa_daily` AS
+CREATE OR REPLACE TABLE `database-sigma.GOLD_DB.fact_video_performa_daily` AS
 
 WITH production_dedup AS (
     SELECT *
@@ -8,7 +8,7 @@ WITH production_dedup AS (
                    PARTITION BY id_konten
                    ORDER BY tanggal DESC
                ) AS rn
-        FROM `database-sigma.Testing.silver_tt_video_production`
+        FROM `database-sigma.SILVER_DB.silver_tt_video_production`
     )
     WHERE rn = 1
 )
@@ -57,6 +57,6 @@ SELECT
     b.link_konten,
     b.hook
 
-FROM `database-sigma.Testing.silver_tt_video` a
+FROM `database-sigma.SILVER_DB.silver_tt_video` a
 LEFT JOIN production_dedup b
     ON a.id_video = b.id_konten;

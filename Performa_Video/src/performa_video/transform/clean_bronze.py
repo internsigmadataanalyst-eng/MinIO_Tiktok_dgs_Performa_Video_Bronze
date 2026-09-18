@@ -48,8 +48,9 @@ def build_bronze_video(
     """
     Dari raw GSheet → cleaning numeric + tanggal + snake_case,
     tambah snapshot_ts, snapshot_date, run_id, row_hash_raw.
-    Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
-    Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates)
+    Filter incremental per (creds,sheet_name,toko) berdasarkan watermark (sheet_watermarks).
+    Watermark grain is (creds, sheet_name, toko) — toko verbatim.
+    Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates: {(creds,sheet_name,toko):iso})
     """
     # numeric cleaning sudah dilakukan di STEP 2 (validate_and_normalize_raw).
     tiktok_video_clean1 = tiktok_video_raw.copy()
@@ -116,10 +117,10 @@ def build_bronze_video(
                 .astype(pd.Int64Dtype())
             )
 
-    # Filter incremental per sheet (creds-keyed) berdasarkan watermark
-    if "creds" in df.columns:
+    # Filter incremental per (creds,sheet_name,toko) — triple grain verbatim
+    if "creds" in df.columns and "sheet_name" in df.columns and "toko" in df.columns:
         df, sheet_max_dates = filter_by_sheet_watermark(
-            df, "creds", "tanggal", sheet_watermarks or {}
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
         )
     else:
         sheet_max_dates = {}
@@ -133,8 +134,8 @@ def build_bronze_produksi(
     """
     Dari raw GSheet → cleaning numeric + tanggal + snake_case,
     tambah snapshot_ts, snapshot_date, run_id, row_hash_raw.
-    Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
-    Output: (df siap di-load ke MinIO, sheet_max_dates)
+    Filter incremental per (creds,sheet_name,akun) berdasarkan watermark — produksi groups by akun.
+    Output: (df siap di-load ke MinIO, sheet_max_dates: {(creds,sheet_name,akun):iso})
     """
 
     # copy & snake_case
@@ -176,10 +177,10 @@ def build_bronze_produksi(
         .apply(lambda s: hashlib.sha256(s.encode()).hexdigest())
     )
 
-    # Filter incremental per sheet (creds-keyed) berdasarkan watermark
-    if "creds" in df.columns:
+    # Filter incremental per (creds,sheet_name,akun) — akun verbatim
+    if "creds" in df.columns and "sheet_name" in df.columns and "akun" in df.columns:
         df, sheet_max_dates = filter_by_sheet_watermark(
-            df, "creds", "tanggal", sheet_watermarks or {}
+            df, "creds", "sheet_name", "akun", "tanggal", sheet_watermarks or {}
         )
     else:
         sheet_max_dates = {}

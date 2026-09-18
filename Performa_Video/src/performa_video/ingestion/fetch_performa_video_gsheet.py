@@ -4,6 +4,8 @@ import os
 import gspread
 import pandas as pd
 
+from src.performa_video.utils.gsheet_client import with_retry_on_429
+
 
 SHEET_REGISTRY = {
     "matz": "SH_KEY_MATZ",
@@ -14,17 +16,20 @@ SHEET_REGISTRY = {
 }
 
 
-def fetch_tiktok_video(gc: gspread.Client) -> pd.DataFrame:
+def fetch_tiktok_video(gc: gspread.Client, spreadsheet_objects: dict | None = None) -> pd.DataFrame:
     """
     Ambil performa video dari GSheet yang terdaftar di SHEET_REGISTRY,
     tag tiap sheet dengan kolom 'sheet_name', lalu concat jadi satu
     DataFrame raw (belum dibersihkan).
     """
+    spreadsheet_objects = spreadsheet_objects or {}
     frames = []
     for sheet_name, env_key in SHEET_REGISTRY.items():
-        sh = gc.open_by_key(os.getenv(env_key))
-        ws = sh.worksheet("Performa Video")
-        values = ws.get_all_values()
+        sh = spreadsheet_objects.get(env_key)
+        if sh is None:
+            sh = with_retry_on_429(gc.open_by_key, os.getenv(env_key))
+        ws = with_retry_on_429(sh.worksheet, "Performa Video")
+        values = with_retry_on_429(ws.get_all_values)
         df_sheet = pd.DataFrame(values[3:], columns=values[2])
         df_sheet = df_sheet.loc[:, ~df_sheet.columns.duplicated()]
         df_sheet["creds"] = os.getenv(env_key)
@@ -36,14 +41,17 @@ def fetch_tiktok_video(gc: gspread.Client) -> pd.DataFrame:
     return tiktok_video
 
 
-def fetch_tiktok_produksi(gc: gspread.Client) -> pd.DataFrame:
+def fetch_tiktok_produksi(gc: gspread.Client, spreadsheet_objects: dict | None = None) -> pd.DataFrame:
     """
     Ambil performa produk dari sh_produksi jadi DataFrame raw (belum dibersihkan),
     di-tag dengan kolom 'sheet_name'.
     """
-    sh_produksi = gc.open_by_key(os.getenv("SH_KEY_PRODUKSI"))
-    ws = sh_produksi.worksheet("DATABASE KONTEN CC E-COM")
-    values = ws.get_all_values()
+    spreadsheet_objects = spreadsheet_objects or {}
+    sh_produksi = spreadsheet_objects.get("SH_KEY_PRODUKSI")
+    if sh_produksi is None:
+        sh_produksi = with_retry_on_429(gc.open_by_key, os.getenv("SH_KEY_PRODUKSI"))
+    ws = with_retry_on_429(sh_produksi.worksheet, "DATABASE KONTEN CC E-COM")
+    values = with_retry_on_429(ws.get_all_values)
 
     tiktok_produksi = pd.DataFrame(values[1:], columns=values[0])
     tiktok_produksi["creds"] = os.getenv("SH_KEY_PRODUKSI")

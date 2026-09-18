@@ -1,5 +1,7 @@
 # src/performa_video/utils/transform_utils.py
 import re
+import warnings
+from datetime import datetime
 from typing import Any, List
 
 import numpy as np
@@ -229,6 +231,14 @@ def validate_and_normalize_raw(
 
     date_error = pd.Series(False, index=df.index)
     date_fail_cols: dict = {idx: [] for idx in df.index}
+    # Future-date gate (soft quarantine) applies to the PRIMARY date column only
+    # (date_cols[0], i.e. 'tanggal') — that is the grain the watermark/manifest
+    # advances on, so it is the only one that can poison ingestion. A date there
+    # strictly after today is a wrong input: it is routed to df_error so it never
+    # reaches the watermark filter. Secondary timestamps (waktu, tanggal_jadi) are
+    # left untouched (future scheduling/processing values can be legitimate).
+    today_ts = pd.Timestamp(datetime.now().date())
+    date_future = pd.Series(False, index=df.index)
     for i, col in enumerate(date_cols):
         if col not in df_clean.columns:
             continue
@@ -238,6 +248,7 @@ def validate_and_normalize_raw(
 
         if i == 0:
             this_err = parsed.isna()
+            date_future = parsed.notna() & (parsed > today_ts)
         else:
             raw = df[col].astype(str).str.strip()
             this_err = parsed.isna() & _is_non_empty(raw)
@@ -246,7 +257,16 @@ def validate_and_normalize_raw(
         for idx in df.index[this_err]:
             date_fail_cols[idx].append(col)
 
-    error_mask = (corruption["affected_mask"] | date_error) & ~blank_mask
+    # Blank toko detection — verbatim, no normalization; only if toko column exists (video has toko, produksi no toko → empty)
+    toko_col_raw = "Toko" if "Toko" in df.columns else ("toko" if "toko" in df.columns else None)
+    if toko_col_raw is not None:
+        raw_toko = df[toko_col_raw].astype(str).str.strip()
+        toko_blank = raw_toko.str.lower().isin(["", "-", "nan", "none", "nat"])
+        toko_blank = toko_blank | df[toko_col_raw].isna()
+    else:
+        toko_blank = pd.Series(False, index=df.index)
+
+    error_mask = (corruption["affected_mask"] | date_error | toko_blank | date_future) & ~blank_mask
 
     df_error = df[error_mask].copy()
     reasons = []
@@ -257,6 +277,10 @@ def validate_and_normalize_raw(
         for col in date_fail_cols[idx]:
             raw_val = str(df.loc[idx, col])
             reason_parts.append(f"date_unparsable({col}={raw_val})")
+        if date_future.loc[idx]:
+            reason_parts.append("date_future")
+        if toko_blank.loc[idx]:
+            reason_parts.append("toko_blank")
         reasons.append("|".join(reason_parts))
     df_error["error_reason"] = reasons
 
@@ -276,7 +300,9 @@ def validate_and_normalize_raw(
         "affected_dates": corruption["affected_dates"],
         "n_bad_rows": int(error_mask.sum()),
         "n_date_errors": int(date_error.sum()),
+        "n_date_future": int(date_future.sum()),
         "n_blank_rows": int(blank_mask.sum()),
+        "n_toko_blank": int(toko_blank.sum()),
     }
 
     return df_valid, df_error, report
@@ -366,6 +392,7 @@ def parse_mixed_dates(series: pd.Series, return_date=True) -> pd.Series:
 
     datetime_str = pd.to_datetime(
         s.where(mask_datetime),
+        format="%Y-%m-%d %H:%M:%S",
         errors="coerce"
     )
 
@@ -431,6 +458,30 @@ def parse_mixed_dates(series: pd.Series, return_date=True) -> pd.Series:
         serial
     ) = date_candidates
 
+    remaining_mask = (
+        ymd.isna()
+        & ymd_datetime.isna()
+        & dmy4.isna()
+        & dmy2.isna()
+        & iso.isna()
+        & datetime_str.isna()
+        & serial.isna()
+        & s.notna()
+    )
+    generic = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if remaining_mask.any():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            parsed_generic = pd.to_datetime(
+                s.loc[remaining_mask], errors="coerce", format="mixed"
+            )
+            # format="mixed" returns out-of-range timestamps (e.g. year 205 from
+            # a truncated "5/6/205") instead of coercing to NaT; clamp to pandas'
+            # valid ns range BEFORE assigning into the datetime64[ns] generic col.
+            in_range = parsed_generic.between(pd.Timestamp.min, pd.Timestamp.max)
+            generic.loc[remaining_mask] = parsed_generic.where(in_range)
+    generic = generic.where(generic.dt.year.between(1900, 2100))
+
     # Combine hasil parsing
     parsed = (
         ymd
@@ -440,6 +491,7 @@ def parse_mixed_dates(series: pd.Series, return_date=True) -> pd.Series:
         .combine_first(iso)
         .combine_first(datetime_str)
         .combine_first(serial)
+        .combine_first(generic)
     )
 
     # Log gagal parsing
