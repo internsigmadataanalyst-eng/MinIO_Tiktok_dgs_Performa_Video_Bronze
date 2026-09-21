@@ -256,7 +256,7 @@ def build_pipeline_success_email(
     grains advanced this run. `bq_updates` lists the BigQuery targets and
     what happened to them (see _render_bq_targets).
     """
-    subject = f"[ETL SUCCESS - {pipeline_name}] Pipeline run succeeded"
+    subject = f"[ETL NOTIFY — {pipeline_name}] Pipeline SUCCESS"
     parts = []
     if status:
         parts.append(f"<p><b>Status:</b> {_html.escape(status)}</p>")
@@ -308,7 +308,7 @@ def build_pipeline_failure_email(
     `auto_rollback_note` reports what (if anything) the pipeline already
     restored automatically (see minio_rollback.py).
     """
-    subject = f"[ETL FAILED - {pipeline_name}] Pipeline run failed"
+    subject = f"[ETL ALERT — {pipeline_name}] Pipeline FAILED"
     parts = [
         f"<p><b>Pipeline:</b> {pipeline_name}</p>",
         f"<p><b>Error type:</b> {type(error).__name__}</p>",
@@ -357,6 +357,7 @@ def build_gate_abort_email(
     note: str = "",
     bq_updates: list[dict] | None = None,
     drift_rows: list[dict] | None = None,
+    pipeline_name: str = PIPELINE_NAME,
 ) -> tuple[str, str]:
     """Summary email for a pre-flight watermark-gate abort.
 
@@ -365,7 +366,7 @@ def build_gate_abort_email(
     `drift_rows` is the per-sheet watermark-drift table (Sheet | Toko |
     Sheet max date | Current watermark | Status), rendered when provided.
     """
-    subject = f"[ETL ABORTED - {PIPELINE_NAME}] Pre-flight gate {gate} rejected"
+    subject = f"[ETL ALERT — {pipeline_name}] ETL aborted — pre-flight gate {gate} rejected"
     parts = [f"<p>{_html.escape(message)}</p>"]
     if mode:
         parts.append(f"<p><b>Mode:</b> {_html.escape(mode)}</p>")
@@ -423,6 +424,7 @@ def build_quarantine_email(
     log_path: str = "",
     sample_size: int = QUARANTINE_SAMPLE_ROWS,
     bq_updates: list[dict] | None = None,
+    pipeline_name: str = PIPELINE_NAME,
 ) -> tuple[str, str]:
     """Summary email when bad rows are quarantined this run.
 
@@ -430,7 +432,7 @@ def build_quarantine_email(
     with keys from QUARANTINE_SAMPLE_COLUMNS, rendered as an HTML table.
     `minio_path` / `log_path` point to the full quarantine data records.
     """
-    subject = f"[ETL QUARANTINE - {PIPELINE_NAME}] {n_quarantined} bad row(s) quarantined"
+    subject = f"[ETL ALERT — {pipeline_name}] Quarantine — {n_quarantined} bad row(s) quarantined"
     parts = [f"<p><b>Quarantined this run:</b> {n_quarantined} row(s)</p>"]
     if affected_columns:
         cols = ", ".join(str(c) for c in affected_columns) or "—"
@@ -490,6 +492,7 @@ def build_quarantine_email(
 
 
 def build_recovery_email(
+    pipeline_name: str = PIPELINE_NAME,
     resolved: int = 0,
     recovered_rows: int = 0,
     absent: int = 0,
@@ -498,7 +501,7 @@ def build_recovery_email(
     bq_updates: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Summary email when previously-broken rows are recovered and re-loaded."""
-    subject = f"[ETL RECOVERY - {PIPELINE_NAME}] {recovered_rows} row(s) recovered"
+    subject = f"[ETL RECOVERY - {pipeline_name}] {recovered_rows} row(s) recovered"
     parts = []
     if dataset_name:
         parts.append(f"<p><b>Dataset:</b> {_html.escape(str(dataset_name))}</p>")
