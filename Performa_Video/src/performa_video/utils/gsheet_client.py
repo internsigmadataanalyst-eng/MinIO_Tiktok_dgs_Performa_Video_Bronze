@@ -7,7 +7,7 @@ from google.oauth2 import service_account
 from gspread.exceptions import APIError
 
 
-def with_retry_on_429(func, *args, max_retries=4, delay=15, **kwargs):
+def with_retry_on_429(func, *args, max_retries=6, delay=15, **kwargs):
     """Call func(*args, **kwargs), retrying on Google Sheets API 429 errors.
 
     Retries with a fixed short delay (default 15s, matching roughly the

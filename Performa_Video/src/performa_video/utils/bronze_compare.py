@@ -55,3 +55,48 @@ def _show_watermark(watermark_records: list):
 def show_watermark(watermark_records: list):
     """Shows only the MinIO watermark (no bronze read/compare)."""
     _show_watermark(watermark_records)
+
+
+def fmt_drift_date(val) -> str:
+    """Format a drift-check date value for the gate-2 email table ('' for NaT)."""
+    try:
+        if val is None or pd.isna(val):
+            return ""
+        if hasattr(val, "strftime"):
+            return val.strftime("%Y-%m-%d")
+        return str(val)
+    except Exception:
+        return str(val or "")
+
+
+def build_drift_rows(status_df: pd.DataFrame) -> list[dict]:
+    """Per-sheet watermark drift summary from the pre-flight check.
+
+    Column order: Sheet | Toko | Sheet max date | Current watermark | Status.
+    Sorted by sheet_name then grain.
+    """
+    rows = []
+    for _, row in status_df.iterrows():
+        rows.append({
+            "sheet_name": str(row.get("sheet_name") or ""),
+            "toko": str(row.get("grain") or ""),
+            "gsheet_max": fmt_drift_date(row.get("sheet_max_tanggal")),
+            "watermark": fmt_drift_date(row.get("last_processed_date")),
+            "status": "BEHIND" if row.get("is_behind") else "ok",
+        })
+    rows.sort(key=lambda r: (r["sheet_name"], r["toko"]))
+    return rows
+
+
+def merge_watermark_updates(*updates: dict) -> dict:
+    """Combine per-dataset watermark-update dicts into one email view.
+
+    Both datasets (video + produksi) render as (creds, sheet_name, grain) ->
+    max_date.  On the rare key collision the later (max) date wins.
+    """
+    merged = {}
+    for u in updates:
+        for key, date_val in (u or {}).items():
+            if key not in merged or str(date_val) > str(merged[key]):
+                merged[key] = date_val
+    return merged

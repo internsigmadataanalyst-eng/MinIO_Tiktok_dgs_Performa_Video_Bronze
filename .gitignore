@@ -12,6 +12,7 @@ DFD_GMV_Max_Produk.docx
 DFD_Document.md
 .opencode/
 backfill_produksi_akun_watermark.py
+PLANNING_STAGE.md
 
 # ETL logs
 logs/

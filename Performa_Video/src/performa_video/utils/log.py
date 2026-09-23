@@ -149,3 +149,53 @@ def emit(
     }
     _event_file.write(json.dumps(event, default=str) + "\n")
     _event_file.flush()
+
+
+def write_wm_log(log_folder, run_key, video_status, produksi_status, video_sheet_passes, verdict_msg):
+    """Write the watermark drift check log file."""
+    wm_log_lines = []
+    wm_log_lines.append(f"=== WATERMARK DRIFT CHECK — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append("DATASET: PERFORMA VIDEO (toko grain)")
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append(f"  {'sheet':<10} {'grain':<12} {'gsheet':<12} {'wm':<12} {'status'}")
+    for _, row in video_status.iterrows():
+        wm_log_lines.append(
+            f"  {row['sheet_name']:<10} {str(row['grain']):<12} "
+            f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
+            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+        )
+
+    wm_log_lines.append("")
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append("DATASET: PRODUKSI (akun grain)")
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append(f"  {'sheet':<10} {'grain':<12} {'gsheet':<12} {'wm':<12} {'status'}")
+    for _, row in produksi_status.iterrows():
+        wm_log_lines.append(
+            f"  {row['sheet_name']:<10} {str(row['grain']):<12} "
+            f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
+            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+        )
+
+    wm_log_lines.append(f"\nGate verdict: {verdict_msg}")
+    video_pass_count = int(video_sheet_passes.sum())
+    video_total = len(video_sheet_passes)
+    produksi_behind = int(produksi_status["is_behind"].sum())
+    produksi_total = len(produksi_status)
+    wm_log_lines.append(f"  video: {video_pass_count}/{video_total} sheets have >=1 toko behind")
+    wm_log_lines.append(f"  produksi: {produksi_behind}/{produksi_total} akun behind")
+
+    write_section_log(log_folder, f"wm_monitor_logs_{run_key}.log", "\n".join(wm_log_lines) + "\n")
+
+
+def write_failure_log(log_folder, run_key, message: str):
+    """Write a gate-abort failure log file for this run."""
+    f_path = write_section_log(
+        log_folder,
+        f"etl_failed_{run_key}.log",
+        f"ETL FAILED because: {message}\n",
+    )
+    print(f"[FATAL] ETL failed because: {message}")
+    print(f"[FATAL] Failure written to: {f_path}")

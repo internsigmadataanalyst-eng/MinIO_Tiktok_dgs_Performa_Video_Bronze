@@ -3,17 +3,16 @@
 
 Why this exists
 ---------------
-Pipeline order is: parquet -> MinIO watermark -> BigQuery bronze append ->
-BigQuery silver MERGE. If the bronze append FAILS the watermark has already
-advanced past rows that never reached BigQuery, so a plain re-run silently
-skips them. This module restores the MinIO state to just before the failed
-run (default scope: the watermark file only), which makes a re-run re-select
-those rows.
+Pipeline order is: parquet -> MinIO -> BigQuery bronze append ->
+Watermark -> BigQuery silver MERGE. If the bronze append FAILS the
+watermark has NOT yet advanced, so a plain re-run safely re-selects
+those rows. This module provides manual/emergency rollback when needed
+(e.g. watermark was somehow updated before a later stage failed).
 
 This project owns TWO datasets in one run (video + produksi) with SEPARATE
 watermark files (watermarks/performa_video.json + watermarks/produksi.json).
 The watermark scope uses prefix-scan of "watermarks/", so both JSONs are
-covered by the automatic restore and the manual 'watermark' scope.
+covered by the manual 'watermark' scope.
 
 Prerequisite (ONE TIME)
 -----------------------
@@ -34,10 +33,6 @@ only appeared after before_ts. This is the SDK equivalent of
 
 Safety
 ------
-- The automatic path (auto_restore_watermark) is scoped to the watermark
-  prefix ONLY (both JSONs), and only mutates when versioning is Enabled AND a
-  pre-run version exists. The current (post-failure) watermark is backed up to
-  rollback_backup/ first, so the rollback itself is reversible.
 - The manual CLI defaults to a --dry-run preview; --execute is required to
   actually delete versions.
 - The 'full' scope additionally purges the failed run's parquet/quarantine/
@@ -246,9 +241,14 @@ def _print_watermark_summary(client: Minio, bucket: str):
 # ---------------------------------------------------------------------------
 
 def auto_restore_watermark(client: Minio, bucket: str, run_key: str) -> str:
-    """Failure-safe auto restore of the watermark to just before a failed run.
+    """Manual/emergency restore of the watermark to just before a failed run.
 
-    Used by the pipeline's bronze-failure handler. Never raises for expected
+    .. note::
+       The pipeline now updates the watermark AFTER BigQuery succeeds, so
+       automatic rollback is no longer needed. This function is kept for
+       manual/emergency use only.
+
+    Never raises for expected
     states; only mutates when every precondition holds:
       1. bucket versioning is Enabled,
       2. a prior watermark version exists (last_modified < before_ts).

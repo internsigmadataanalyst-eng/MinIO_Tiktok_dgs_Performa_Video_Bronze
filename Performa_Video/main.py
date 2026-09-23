@@ -4,7 +4,7 @@ from datetime import datetime
 print(">>> main.py started")
 
 from src.performa_video.pipelines.run_daily_etl import run_daily_etl
-import src.performa_video.pipelines.run_daily_etl as pipeline_mod
+from src.performa_video.pipelines.config import _failure_ctx, BQ_TARGETS
 from src.performa_video.utils.log import (
     setup_run_logging,
     setup_event_logging,
@@ -13,6 +13,7 @@ from src.performa_video.utils.log import (
 from src.performa_video.utils.notify import (
     build_pipeline_failure_email,
     send_alert_email,
+    close_smtp,
 )
 
 if __name__ == "__main__":
@@ -22,7 +23,6 @@ if __name__ == "__main__":
 
     run_key = datetime.now().strftime("%Y%m%d%H%M")
 
-    # Only capture run transcripts for production runs, not dry-run
     if not dry_run:
         log_path, restore_logging = setup_run_logging(run_key)
         print(f">>> Log file: {log_path}")
@@ -30,7 +30,6 @@ if __name__ == "__main__":
         log_path = ""
         restore_logging = None
 
-    # Structured JSON events: written for BOTH production and dry-run
     _, stop_event_logging = setup_event_logging(run_key, dry_run)
 
     try:
@@ -46,17 +45,17 @@ if __name__ == "__main__":
             f"Unhandled exception: {type(e).__name__} {e}",
             level="ERROR",
         )
-        ctx = getattr(pipeline_mod, "_failure_ctx", None) or {}
         subject, body_html = build_pipeline_failure_email(
             e,
             run_key=run_key,
             log_path=log_path,
-            bq_updates=getattr(pipeline_mod, "BQ_TARGETS", []),
-            **ctx,
+            bq_updates=BQ_TARGETS,
+            **_failure_ctx,
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
         raise
     finally:
+        close_smtp()
         stop_event_logging()
         if restore_logging:
             restore_logging()

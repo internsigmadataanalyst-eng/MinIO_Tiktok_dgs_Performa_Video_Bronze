@@ -63,6 +63,9 @@ SMTP_PORT = int(os.getenv("NOTIFY_SMTP_PORT", "587"))
 SENDER_EMAIL = os.getenv("NOTIFY_SENDER_EMAIL", "")
 SENDER_APP_PASSWORD = os.getenv("NOTIFY_SENDER_APP_PASSWORD", "")
 
+# Persistent SMTP connection (created lazily on first send, closed by close_smtp).
+_smtp_server: smtplib.SMTP | None = None
+
 # Default recipient list for pipeline alerts (shared by both backends).
 DEFAULT_RECIPIENTS = [
     r.strip()
@@ -102,6 +105,7 @@ def _send_via_gmail_api(subject: str, body_html: str, to_list: list[str]) -> Non
 
 
 def _send_via_smtp(subject: str, body_html: str, to_list: list[str]) -> None:
+    global _smtp_server
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
         raise RuntimeError(
             "NOTIFY_SENDER_EMAIL / NOTIFY_SENDER_APP_PASSWORD not set — "
@@ -113,12 +117,35 @@ def _send_via_smtp(subject: str, body_html: str, to_list: list[str]) -> None:
     msg["From"] = SENDER_EMAIL
     msg["To"] = ", ".join(to_list)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-        server.sendmail(SENDER_EMAIL, to_list, msg.as_string())
+    if _smtp_server is None:
+        _smtp_server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        _smtp_server.ehlo()
+        _smtp_server.starttls()
+        _smtp_server.ehlo()
+        _smtp_server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+
+    try:
+        _smtp_server.sendmail(SENDER_EMAIL, to_list, msg.as_string())
+    except (smtplib.SMTPException, ConnectionError, OSError):
+        # Connection stale or dropped — reconnect once and retry
+        _smtp_server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        _smtp_server.ehlo()
+        _smtp_server.starttls()
+        _smtp_server.ehlo()
+        _smtp_server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+        _smtp_server.sendmail(SENDER_EMAIL, to_list, msg.as_string())
+
+
+def close_smtp() -> None:
+    """Gracefully close the shared SMTP connection. No-op if not connected."""
+    global _smtp_server
+    if _smtp_server is None:
+        return
+    try:
+        _smtp_server.quit()
+    except Exception:
+        pass
+    _smtp_server = None
 
 
 def send_alert_email(
@@ -296,17 +323,13 @@ def build_pipeline_failure_email(
     bq_updates: list[dict] | None = None,
     minio_files: list[str] | None = None,
     rollback_hint: str = "",
-    rollback_command: str = "",
-    auto_rollback_note: str = "",
 ) -> tuple[str, str]:
     """Summary email for an unhandled pipeline exception.
 
     `stage` names the pipeline stage that failed (e.g. BigQuery bronze load).
     `minio_files` lists MinIO artifacts written/maybe-written this run so an
     operator can decide on rollback; `rollback_hint` gives stage-accurate
-    guidance, `rollback_command` a ready-to-paste manual command, and
-    `auto_rollback_note` reports what (if anything) the pipeline already
-    restored automatically (see minio_rollback.py).
+    guidance on whether manual rollback is needed.
     """
     subject = f"[ETL ALERT — {pipeline_name}] Pipeline FAILED"
     parts = [
@@ -334,12 +357,6 @@ def build_pipeline_failure_email(
         )
     if rollback_hint:
         parts.append(f"<p><b>Rollback guidance:</b> {_html.escape(rollback_hint)}</p>")
-    if auto_rollback_note:
-        parts.append(f"<p><b>Auto rollback:</b> {_html.escape(auto_rollback_note)}</p>")
-    if rollback_command:
-        parts.append(
-            f"<p><b>Rollback command:</b> <code>{_html.escape(rollback_command)}</code></p>"
-        )
 
     body = (
         "<html><body><h3>Pipeline run failed</h3>"
@@ -526,3 +543,76 @@ def build_recovery_email(
         + "</body></html>"
     )
     return subject, body
+
+
+# ---------------------------------------------------------------------------
+# BQ-update summary helpers
+# ---------------------------------------------------------------------------
+
+def bq_full_load(loaded_rows: dict) -> list[dict]:
+    """BQ-update summary for a run that appended rows to both bronze tables,
+    merged both silvers and rebuilt gold."""
+    from src.performa_video.pipelines.config import (
+        TGT_BQ_BRONZE_VIDEO,
+        TGT_BQ_BRONZE_PRODUCTION,
+        TGT_BQ_SILVER_VIDEO,
+        TGT_BQ_SILVER_PRODUCTION,
+        TGT_GOLD,
+    )
+    return [
+        {"table": TGT_BQ_BRONZE_VIDEO["entity"], "action": "append",
+         "rows": int(loaded_rows.get("video", 0))},
+        {"table": TGT_BQ_BRONZE_PRODUCTION["entity"], "action": "append",
+         "rows": int(loaded_rows.get("produksi", 0))},
+        {"table": TGT_BQ_SILVER_VIDEO["entity"], "action": "MERGE (silver upsert)"},
+        {"table": TGT_BQ_SILVER_PRODUCTION["entity"], "action": "MERGE (silver upsert)"},
+        {"table": TGT_GOLD["entity"], "action": "CREATE OR REPLACE (gold rebuild)"},
+    ]
+
+
+def bq_noop() -> list[dict]:
+    """BQ-update summary for a successful run with no new rows to load."""
+    from src.performa_video.pipelines.config import (
+        TGT_BQ_BRONZE_VIDEO,
+        TGT_BQ_BRONZE_PRODUCTION,
+        TGT_BQ_SILVER_VIDEO,
+        TGT_BQ_SILVER_PRODUCTION,
+        TGT_GOLD,
+    )
+    return [
+        {"table": TGT_BQ_BRONZE_VIDEO["entity"], "action": "no change", "rows": 0},
+        {"table": TGT_BQ_BRONZE_PRODUCTION["entity"], "action": "no change", "rows": 0},
+        {"table": TGT_BQ_SILVER_VIDEO["entity"], "action": "no change"},
+        {"table": TGT_BQ_SILVER_PRODUCTION["entity"], "action": "no change"},
+        {"table": TGT_GOLD["entity"], "action": "no change"},
+    ]
+
+
+def finish(
+    watermark_records,
+    note: str,
+    status: str = "",
+    dry_run: bool = False,
+    run_key: str = "",
+    watermark_updates: dict | None = None,
+    bq_updates: list[dict] | None = None,
+    datasets_config: dict | None = None,
+):
+    """Final step on every exit path: show both datasets' watermarks, print the
+    ETL DONE line, then send the success alert (skipped in dry-run).
+    """
+    from src.performa_video.utils.bronze_compare import show_watermark
+
+    for name, cfg in (datasets_config or {}).items():
+        recs = watermark_records.get(name, []) if isinstance(watermark_records, dict) else []
+        show_watermark(recs)
+        print(f"[WATERMARK][{name}] Lihat watermark di atas (path: {cfg['watermark_path']})")
+    print(note)
+    subject, body_html = build_pipeline_success_email(
+        run_key=run_key,
+        log_path=f"logs/run_{run_key}/etl_full_{run_key}.log" if run_key else "",
+        status=status,
+        watermark_updates=watermark_updates,
+        bq_updates=bq_updates,
+    )
+    send_alert_email(subject, body_html, dry_run=dry_run)
