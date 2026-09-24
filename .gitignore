@@ -13,6 +13,10 @@ DFD_Document.md
 .opencode/
 backfill_produksi_akun_watermark.py
 PLANNING_STAGE.md
+scripts/
 
 # ETL logs
 logs/
+
+# E2E dummy-data quarantine flow test (runs real emails, writes blocked)
+Performa_Video/scripts/test_etl_quarantine_flow.py

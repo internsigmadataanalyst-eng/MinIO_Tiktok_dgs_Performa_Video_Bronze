@@ -39,8 +39,12 @@ from src.performa_video.utils.minio_client import (
     get_sheet_watermarks,
     update_sheet_watermarks,
     write_quarantine,
+    filter_already_quarantined,
     sync_error_manifest,
     QUARANTINE_PREFIX,
+)
+from src.performa_video.utils.quarantine_columns import (
+    QUARANTINE_SAMPLE_COLUMNS as TABLE_QUARANTINE_COLUMNS,
 )
 from src.performa_video.utils.transform_utils import (
     NUMERIC_COLS,
@@ -72,7 +76,6 @@ from src.performa_video.utils.notify import (
     build_quarantine_email,
     build_recovery_email,
     QUARANTINE_SAMPLE_ROWS,
-    QUARANTINE_SAMPLE_COLUMNS,
     bq_full_load,
     finish,
 )
@@ -193,6 +196,7 @@ def run_daily_etl(dry_run: bool | None = None):
             message=f"Access errors while checking sheets: {error_sheets}",
             lists={"error_sheets": error_sheets},
             note="Fix the sheet access issue and re-run.",
+            enable_explanation=not dry_run,
             bq_updates=BQ_TARGETS,
         )
         send_alert_email(subject, body_html, dry_run=dry_run)
@@ -257,6 +261,7 @@ def run_daily_etl(dry_run: bool | None = None):
                 ">=1 toko behind. If this is expected (no genuinely new data), no "
                 "action needed; otherwise check the source sheet dates."
             ),
+            enable_explanation=not dry_run,
             bq_updates=BQ_TARGETS,
             drift_rows=build_drift_rows(video_status),
         )
@@ -384,13 +389,27 @@ def run_daily_etl(dry_run: bool | None = None):
                 f"---> {v_report['last_affected_date']}"
             )
 
+        df_error_new = (
+            filter_already_quarantined(
+                minio_client, minio_bucket, df_error,
+                manifest_path=cfg["manifest_path"], grain_col=cfg["grain_col"],
+            )
+            if not df_error.empty
+            else df_error
+        )
+        n_dupes_skipped = max(0, len(df_error) - len(df_error_new))
+
         resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, subfolder=name, manifest_path=cfg["manifest_path"], fix_prefix=cfg["fix_prefix"], date_col=date_col, df_valid=df_valid, dry_run=dry_run, grain_col=cfg["grain_col"])
 
         if not df_error.empty:
-            if "error_reason" in df_error.columns:
-                all_reasons = df_error["error_reason"].str.split("|").explode()
+            src_rows = df_error_new if not df_error_new.empty else df_error
+            live_cols = [
+                c for c in TABLE_QUARANTINE_COLUMNS[name] if c in src_rows.columns
+            ]
+            if "error_reason" in src_rows.columns:
+                all_reasons = src_rows["error_reason"].str.split("|").explode()
                 reason_counts = all_reasons.value_counts().to_dict()
-                col_pattern = df_error["error_reason"].str.findall(r"date_unparsable\((\w+)=")
+                col_pattern = src_rows["error_reason"].str.findall(r"date_unparsable\((\w+)=")
                 affected_from_dates = set()
                 for cols in col_pattern:
                     affected_from_dates.update(cols)
@@ -399,17 +418,19 @@ def run_daily_etl(dry_run: bool | None = None):
                 reason_counts = None
                 affected_cols = []
 
+            n_quarantined = int(len(df_error_new))
             if dry_run:
-                print(f"[DRY-RUN][{name}] Akan quarantine {len(df_error)} bad row(s)")
+                print(f"[DRY-RUN][{name}] Akan quarantine {n_quarantined} bad row(s)")
             else:
-                write_quarantine(minio_client, minio_bucket, df_error, today_key, run_key, subfolder=name)
+                write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key, subfolder=name)
 
                 if log_folder:
-                    import re as _re
                     q_lines = []
                     q_lines.append(f"=== QUARANTINE REPORT — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                     q_lines.append(f"Dataset: {name}")
-                    q_lines.append(f"  Total quarantined rows: {len(df_error)}\n")
+                    q_lines.append(f"  Total quarantined rows: {n_quarantined}")
+                    if n_dupes_skipped:
+                        q_lines.append(f"  Already-known duplicates skipped: {n_dupes_skipped}\n")
 
                     if reason_counts is not None:
                         q_lines.append("  Error reasons breakdown:")
@@ -420,10 +441,9 @@ def run_daily_etl(dry_run: bool | None = None):
                         if affected_cols:
                             q_lines.append(f"  Affected columns: {affected_cols}\n")
 
-                    sample = df_error.head(5)
+                    sample = src_rows.head(5)
                     q_lines.append(f"  Sample bad rows (first {len(sample)}):")
-                    display_cols = [c for c in ["Tanggal", "tanggal", "Toko", "toko", "Akun", "akun",
-                                                 "VV", "Likes", "error_reason"] if c in sample.columns]
+                    display_cols = [c for c in live_cols if c in sample.columns]
                     if display_cols:
                         header = " | ".join(f"{c:<15}" for c in display_cols)
                         q_lines.append(f"    | {header} |")
@@ -436,9 +456,15 @@ def run_daily_etl(dry_run: bool | None = None):
                     write_section_log(log_folder, f"quarantine_errors_{run_key}.log", "\n".join(q_lines) + "\n")
             emit(
                 "QUARANTINE", "validator",
-                f"[{name}] {len(df_error)} bad row(s) quarantined",
+                f"[{name}] {n_quarantined} bad row(s) quarantined (new) | "
+                f"{n_dupes_skipped} already-known duplicate(s) skipped",
                 level="WARN",
-                metrics={"dataset": name, "n_quarantined": int(len(df_error))},
+                metrics={
+                    "dataset": name,
+                    "n_quarantined": n_quarantined,
+                    "n_detected": int(len(df_error)),
+                    "n_duplicates_skipped": int(n_dupes_skipped),
+                },
                 source=src,
                 target=tgt_q,
             )
@@ -447,9 +473,11 @@ def run_daily_etl(dry_run: bool | None = None):
                 reason_counts,
                 affected_cols,
                 sample_rows=[
-                    {c: r[c] for c in QUARANTINE_SAMPLE_COLUMNS if c in df_error.columns}
-                    for _, r in df_error.head(QUARANTINE_SAMPLE_ROWS).iterrows()
+                    {c: r[c] for c in live_cols}
+                    for _, r in src_rows.head(QUARANTINE_SAMPLE_ROWS).iterrows()
                 ],
+                columns=live_cols,
+                n_duplicates_skipped=int(n_dupes_skipped),
                 minio_path=(
                     f"{QUARANTINE_PREFIX}/{name}/date={today_key}/quarantine_{run_key}.parquet"
                     if not dry_run
@@ -460,6 +488,8 @@ def run_daily_etl(dry_run: bool | None = None):
                     if log_folder
                     else ""
                 ),
+                dataset_name=name,
+                enable_explanation=not dry_run,
                 bq_updates=BQ_TARGETS,
             )
             send_alert_email(subject, body_html, dry_run=dry_run)
@@ -500,6 +530,7 @@ def run_daily_etl(dry_run: bool | None = None):
                 absent=v_report.get("recovery_absent", 0),
                 count_mismatch_skipped=v_report.get("recovery_count_mismatch", 0),
                 dataset_name=name,
+                enable_explanation=not dry_run,
                 bq_updates=BQ_TARGETS,
             )
             send_alert_email(subject, body_html, dry_run=dry_run)

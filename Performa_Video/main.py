@@ -49,6 +49,7 @@ if __name__ == "__main__":
             e,
             run_key=run_key,
             log_path=log_path,
+            enable_explanation=not dry_run,
             bq_updates=BQ_TARGETS,
             **_failure_ctx,
         )
