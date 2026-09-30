@@ -82,7 +82,7 @@ def build_drift_rows(status_df: pd.DataFrame) -> list[dict]:
             "toko": str(row.get("grain") or ""),
             "gsheet_max": fmt_drift_date(row.get("sheet_max_tanggal")),
             "watermark": fmt_drift_date(row.get("last_processed_date")),
-            "status": "BEHIND" if row.get("is_behind") else "ok",
+            "status": "UPDATE" if row.get("needs_update") else "ok",
         })
     rows.sort(key=lambda r: (r["sheet_name"], r["toko"]))
     return rows

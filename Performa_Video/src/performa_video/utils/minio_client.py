@@ -127,6 +127,110 @@ FIX_MANIFEST_PREFIX = "fix_error_list_watermark"
 QUARANTINE_PREFIX = "quarantine"
 
 
+def read_error_manifest(minio_client: Minio, bucket: str, manifest_path: str = ERROR_MANIFEST_PATH) -> tuple[list, bool]:
+    """Reads the error manifest. Returns (open_records, manifest_existed).
+
+    A missing/unreadable-as-absent object yields ([], False) so callers can tell
+    "no manifest yet" from "manifest present but empty". Any other S3Error
+    propagates.
+
+    Shared by filter_already_quarantined (the dedupe gate),
+    get_open_error_entries (the pre-flight recovery check) and
+    sync_error_manifest, so all three see exactly the same open-entry state.
+    """
+    try:
+        minio_client.stat_object(bucket, manifest_path)
+        response = minio_client.get_object(bucket, manifest_path)
+        data = json.loads(response.read().decode("utf-8"))
+        response.close()
+        response.release_conn()
+    except S3Error as e:
+        if e.code in ["NoSuchKey", "AccessDenied"]:
+            return [], False
+        raise e
+    return [r for r in data.get("errors", []) if r.get("status") == "open"], True
+
+
+def _entry_open_since(rec: dict) -> datetime | None:
+    """When this error entry was FIRST reported, parsed. None when unparseable.
+
+    Prefers the preserved `open_since`; falls back to `reported_at` for entries
+    written before `open_since` existed (no migration needed on upgrade).
+    """
+    raw = rec.get("open_since") or rec.get("reported_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_open_error_entries(
+    minio_client: Minio,
+    bucket: str,
+    manifest_path: str = ERROR_MANIFEST_PATH,
+    max_age_days: int | None = None,
+) -> list[dict]:
+    """Open error-manifest entries, oldest first.
+
+    Each returned dict gains a computed `age_days` key (float). When
+    `max_age_days` is not None, only entries whose age is <= max_age_days are
+    returned — this bounds how long a stuck entry can hold the pre-flight gate
+    open. Entries with no parseable `open_since`/`reported_at` are treated as
+    fresh (age 0) so a malformed timestamp can never silently expire a real
+    defect; they age out on the next sync once `open_since` is written.
+    """
+    open_records, _ = read_error_manifest(minio_client, bucket, manifest_path)
+    if not open_records:
+        return []
+
+    now = datetime.now()
+    out = []
+    for rec in open_records:
+        rec = dict(rec)
+        since = _entry_open_since(rec)
+        age_days = 0.0 if since is None else (now - since).total_seconds() / 86400.0
+        rec["age_days"] = round(age_days, 2)
+        if max_age_days is None or age_days <= max_age_days:
+            out.append(rec)
+
+    out.sort(key=lambda r: (-r["age_days"], str(r.get("sheet_name")), str(r.get("error_date"))))
+    return out
+
+
+def _reason_shape(reason: str) -> str:
+    """Reduce a per-row error label to its SHAPE, dropping any embedded value.
+
+    validate_and_normalize_raw builds labels like
+    `date_unparsable(Tanggal=30/01/20206)`, i.e. one distinct label per distinct
+    bad value. Keying change-detection on those verbatim labels would make a
+    signature huge and would flip on a value that is still equally broken, which
+    is not a recovery signal. Stripping the `=<value>` tail makes the signature
+    describe WHAT is wrong rather than WHICH wrong text was typed.
+
+    The verbatim labels are still written to the manifest (and the bad values
+    separately, in `bad_values`), so nothing forensic is lost.
+    """
+    return str(reason).split("=", 1)[0] + ")" if "=" in str(reason) else str(reason)
+
+
+def _signature(entry: dict) -> tuple:
+    """Change-detection signature of a manifest entry: (n_rows, reason shapes).
+
+    Two detections of the same group are "the same defect" only when both the
+    bad-row count AND the set of reason shapes are unchanged. Any difference
+    means the defect changed shape — some rows were fixed, or a different kind
+    of corruption appeared — which is what makes the group re-admittable.
+    """
+    try:
+        n_rows = int(entry.get("n_rows") or 0)
+    except (TypeError, ValueError):
+        n_rows = 0
+    reasons = tuple(sorted(_reason_shape(r) for r in (entry.get("error_reasons") or [])))
+    return (n_rows, reasons)
+
+
 def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, today_key: str, run_key: str, subfolder: str = ""):
     """Saves bad rows to MinIO under quarantine/[subfolder/]date=YYYYMMDD/<run_key>.parquet."""
     if df_error.empty:
@@ -149,20 +253,42 @@ def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, t
     print(f"[MINIO] Quarantine bad rows to: {file_path}")
 
 
-def _error_date_series(df: pd.DataFrame) -> pd.Series:
-    """Parses the Tanggal column into ISO date strings for error grouping.
+def _error_date_series(df: pd.DataFrame, date_col: str = "Tanggal") -> pd.Series:
+    """Parses the date column into ISO date strings for error grouping.
 
     Unparseable dates become the literal 'INVALID_DATE' so they still form a
     stable group key. Shared by filter_already_quarantined (the dedupe gate)
     and sync_error_manifest so both use EXACTLY the same matching grain.
+
+    `date_col` is the caller's RESOLVED raw header name, which differs per table
+    (video -> 'Tanggal', produksi -> 'TANGGAL'). It is matched case-insensitively
+    so a caller that did not resolve it still finds the column; falling back to
+    a single bucket would collapse every group of that table into one
+    INVALID_DATE group, which would both defeat the dedupe gate and poison
+    recovery matching.
     """
     from src.performa_video.utils.transform_utils import parse_mixed_dates
 
-    if "Tanggal" in df.columns:
-        parsed = parse_mixed_dates(df["Tanggal"], return_date=False)
+    col = _date_col(df, date_col)
+    if col is not None:
+        parsed = parse_mixed_dates(df[col], return_date=False)
         error_date = parsed.dt.date.astype(str)
         return error_date.where(parsed.notna(), "INVALID_DATE")
     return pd.Series("INVALID_DATE", index=df.index)
+
+
+def _date_col(df: pd.DataFrame, date_col: str):
+    """Returns the actual column name matching `date_col` case-insensitively, or None.
+
+    Raw GSheet frames use whatever casing the sheet has ('Tanggal' for video,
+    'TANGGAL' for produksi) before build_bronze_* runs to_snake_case.
+    """
+    if date_col in df.columns:
+        return date_col
+    for c in df.columns:
+        if str(c).strip().lower() == str(date_col).strip().lower():
+            return c
+    return None
 
 
 def _grain_col(df: pd.DataFrame, grain_col: str):
@@ -193,13 +319,17 @@ def _grain_series(df: pd.DataFrame, grain_col: str) -> pd.Series:
     return pd.Series("", index=df.index, dtype=str)
 
 
-def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.DataFrame, manifest_path: str = ERROR_MANIFEST_PATH, grain_col: str = "toko") -> pd.DataFrame:
+def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.DataFrame, manifest_path: str = ERROR_MANIFEST_PATH, grain_col: str = "toko", date_col: str = "Tanggal") -> pd.DataFrame:
     """Dedupe gate BEFORE writing quarantine: drops already-quarantined bad rows.
 
     Compares df_error against the manifest state of the LAST run. A group
     (sheet_name, creds, grain, error_date) is skipped ONLY when an open manifest entry
     exists with the same key AND the same n_rows. New tanggal, new sheet, new grain,
     or a changed row count pass through in full and get re-quarantined.
+
+    `date_col` must be the same resolved column name the caller passes to
+    sync_error_manifest; the two must group identically or the gate would
+    compare against keys that can never match.
 
     MUST be called BEFORE sync_error_manifest: that function writes this run's
     groups into the manifest, so calling it after would make every group look
@@ -208,17 +338,9 @@ def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.Da
     if df_error is None or df_error.empty:
         return df_error
 
-    try:
-        minio_client.stat_object(bucket, manifest_path)
-        response = minio_client.get_object(bucket, manifest_path)
-        data = json.loads(response.read().decode("utf-8"))
-        response.close()
-        response.release_conn()
-        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
-    except S3Error as e:
-        if e.code in ["NoSuchKey", "AccessDenied"]:
-            return df_error
-        raise e
+    open_records, _ = read_error_manifest(minio_client, bucket, manifest_path)
+    if not open_records:
+        return df_error
 
     known = {}
     for rec in open_records:
@@ -229,7 +351,7 @@ def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.Da
             known[key] = 0
 
     df = df_error.copy()
-    df["_error_date"] = _error_date_series(df)
+    df["_error_date"] = _error_date_series(df, date_col)
     sn_col = "sheet_name" if "sheet_name" in df.columns else "creds"
     cr_col = "creds" if "creds" in df.columns else sn_col
     toko_col = _grain_col(df, grain_col)
@@ -354,12 +476,18 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
       5. Writes the manifest back only if something changed (avoids creating
          an empty file when there is nothing to do).
 
-    Returns the list of confirmed resolved entries (sheet_name, creds, toko, error_date)
-    so callers can re-load the recovered rows via PATH A (bypassing the watermark).
+    Returns the two kinds of group whose VALID rows must be re-admitted by PATH A
+    (bypassing the watermark), as a (resolved, readmit) tuple:
+      resolved : the group is no longer detected as bad at all (defect gone, or a
+                 date_future / legacy future-date entry remediated).
+      readmit  : the group is STILL detected, but its signature
+                 (n_rows, error_reasons shape) changed — some rows were fixed, or
+                 the defect changed shape.
+    A group whose signature is unchanged appears in neither: nothing recoverable
+    moved, so there is nothing to re-admit.
     """
     if df_valid is None:
         df_valid = df_error.iloc[0:0]
-    from src.performa_video.utils.transform_utils import parse_mixed_dates
 
     now = datetime.now().isoformat()
     sub = f"{subfolder}/" if subfolder else ""
@@ -368,14 +496,7 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
     current_entries = []
     if not df_error.empty:
         df_error = df_error.copy()
-        if date_col in df_error.columns:
-            df_error["_parsed_date"] = parse_mixed_dates(df_error[date_col], return_date=False)
-            df_error["_error_date"] = df_error["_parsed_date"].dt.date.astype(str)
-            df_error["_error_date"] = df_error["_error_date"].where(
-                df_error["_parsed_date"].notna(), "INVALID_DATE"
-            )
-        else:
-            df_error["_error_date"] = "INVALID_DATE"
+        df_error["_error_date"] = _error_date_series(df_error, date_col)
 
         sn_col = "sheet_name" if "sheet_name" in df_error.columns else "creds"
         cr_col = "creds" if "creds" in df_error.columns else sn_col
@@ -418,20 +539,7 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
                 "status": "open",
             })
 
-    manifest_existed = True
-    try:
-        minio_client.stat_object(bucket, manifest_path)
-        response = minio_client.get_object(bucket, manifest_path)
-        data = json.loads(response.read().decode("utf-8"))
-        response.close()
-        response.release_conn()
-        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
-    except S3Error as e:
-        if e.code in ["NoSuchKey", "AccessDenied"]:
-            open_records = []
-            manifest_existed = False
-        else:
-            raise e
+    open_records, manifest_existed = read_error_manifest(minio_client, bucket, manifest_path)
 
     current_keys = {(e["sheet_name"], e["creds"], e.get("toko") or "", e["error_date"]) for e in current_entries}
 
@@ -469,12 +577,23 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
     # Fresh current-run entries always win: refresh n_rows / affected_columns /
     # reported_at / path for keys that already exist, append brand-new keys.
     # Preserve original bad_values via union so historical values are never lost.
+    #
+    # `open_since` is carried over from the previous entry so the age of a stuck
+    # defect keeps growing; without it, reported_at alone would refresh daily
+    # and the pre-flight recovery gate could never expire the entry. A group
+    # whose signature CHANGED is reported as `readmit`: it is still broken, but
+    # its shape moved, so its valid rows must be re-admitted by PATH A.
+    readmit = []
     for entry in current_entries:
         key = (entry["sheet_name"], entry["creds"], entry["toko"], entry["error_date"])
+        prev = refreshed.get(key)
         if key in refreshed:
             old_bv = set(refreshed[key].get("bad_values", []))
             new_bv = set(entry.get("bad_values", []))
             entry["bad_values"] = sorted(old_bv | new_bv)
+        entry["open_since"] = (prev or {}).get("open_since") or now
+        if prev is not None and _signature(prev) != _signature(entry):
+            readmit.append(entry)
         refreshed[key] = entry
 
     remaining = list(refreshed.values())
@@ -485,7 +604,7 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
     old_payload = json.dumps({"errors": open_records}, ensure_ascii=False, sort_keys=True)
     changed = bool(resolved) or new_payload != old_payload
     if not changed and not manifest_existed:
-        return []
+        return [], []
 
     if resolved:
         fix_folder = f"{fix_prefix}/date={today_key}/"
@@ -532,7 +651,9 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
         )
         if current_entries:
             print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
-    return resolved
+    if readmit:
+        print(f"[MINIO][{subfolder or 'quarantine'}] {len(readmit)} error entr(y/ies) changed signature -> PATH A re-admit")
+    return resolved, readmit
 
 
 def filter_by_sheet_watermark(df: pd.DataFrame, creds_col: str, sheet_name_col: str, toko_col: str, date_col: str, watermarks: dict) -> tuple[pd.DataFrame, dict]:

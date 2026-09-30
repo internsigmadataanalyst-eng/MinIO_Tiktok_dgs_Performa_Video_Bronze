@@ -20,3 +20,6 @@ logs/
 
 # E2E dummy-data quarantine flow test (runs real emails, writes blocked)
 Performa_Video/scripts/test_etl_quarantine_flow.py
+
+# Offline quarantine v2 verification harness (FakeMinio, no live services)
+Performa_Video/verify_quarantine_v2.py

@@ -164,7 +164,7 @@ def write_wm_log(log_folder, run_key, video_status, produksi_status, video_sheet
         wm_log_lines.append(
             f"  {row['sheet_name']:<10} {str(row['grain']):<12} "
             f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
-            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+            f"{'UPDATE' if row['needs_update'] else 'ok'}"
         )
 
     wm_log_lines.append("")
@@ -176,16 +176,16 @@ def write_wm_log(log_folder, run_key, video_status, produksi_status, video_sheet
         wm_log_lines.append(
             f"  {row['sheet_name']:<10} {str(row['grain']):<12} "
             f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
-            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+            f"{'UPDATE' if row['needs_update'] else 'ok'}"
         )
 
     wm_log_lines.append(f"\nGate verdict: {verdict_msg}")
     video_pass_count = int(video_sheet_passes.sum())
     video_total = len(video_sheet_passes)
-    produksi_behind = int(produksi_status["is_behind"].sum())
+    produksi_needing_update = int(produksi_status["needs_update"].sum())
     produksi_total = len(produksi_status)
-    wm_log_lines.append(f"  video: {video_pass_count}/{video_total} sheets have >=1 toko behind")
-    wm_log_lines.append(f"  produksi: {produksi_behind}/{produksi_total} akun behind")
+    wm_log_lines.append(f"  video: {video_pass_count}/{video_total} sheets have >=1 toko needing update")
+    wm_log_lines.append(f"  produksi: {produksi_needing_update}/{produksi_total} akun needing update")
 
     write_section_log(log_folder, f"wm_monitor_logs_{run_key}.log", "\n".join(wm_log_lines) + "\n")
 

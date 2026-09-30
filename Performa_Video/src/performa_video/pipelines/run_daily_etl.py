@@ -9,12 +9,15 @@ import pandas as pd
 
 from src.performa_video.pipelines.config import (
     PROJECT_ID,
+    SRC_GSHEET,
     SRC_MINIO,
     TGT_BQ_SILVER_VIDEO,
     TGT_BQ_SILVER_PRODUCTION,
     TGT_GOLD,
     WHITELIST_SHEETS,
     BQ_TARGETS,
+    QUARANTINE_MANIFEST_PATHS,
+    QUARANTINE_RECOVERY_MAX_AGE_DAYS,
     _failure_ctx,
 )
 from src.performa_video.ingestion.fetch_performa_video_gsheet import (
@@ -41,6 +44,7 @@ from src.performa_video.utils.minio_client import (
     write_quarantine,
     filter_already_quarantined,
     sync_error_manifest,
+    get_open_error_entries,
     QUARANTINE_PREFIX,
 )
 from src.performa_video.utils.quarantine_columns import (
@@ -84,6 +88,74 @@ from src.performa_video.utils.bq_client import (
     fetch_existing_bronze_hashes,
 )
 from src.performa_video.utils.recovery import select_recovered
+
+
+def _split_recovery_entries(entries: list[dict], max_age_days: int) -> tuple[list[dict], list[dict]]:
+    """Splits open error entries into (within age cap, past age cap).
+
+    The age cap is what stops a permanently-stuck entry from holding the
+    pre-flight gate open forever. A capped-out entry is NOT forgotten: it is
+    reported in the gate-abort email as STUCK so a human still sees it.
+    """
+    within, expired = [], []
+    for e in entries:
+        if (e.get("age_days") or 0) <= max_age_days:
+            within.append(e)
+        else:
+            expired.append(e)
+    return within, expired
+
+
+def _recovery_label(e: dict) -> str:
+    """Compact operator-facing label for one stuck quarantine entry."""
+    return (
+        f"{e.get('sheet_name', '?')} | creds={str(e.get('creds'))[:12]} "
+        f"| grain={e.get('toko') or '-'} | date={e.get('error_date', '?')} "
+        f"| n_rows={e.get('n_rows', '?')} | age={e.get('age_days', 0)}d"
+    )
+
+
+def _quarantine_write(minio_client, bucket, df_error, df_valid, v_report, *, dry_run, subfolder, date_col, grain_col, manifest_path, fix_prefix, today_key, run_key):
+    """Fail-closed quarantine write: dedupe -> evidence parquet -> manifest.
+
+    Order is mandatory and each step may abort the run:
+
+      1. filter_already_quarantined  must run BEFORE the manifest is touched,
+         otherwise every group looks like a duplicate of itself and nothing
+         would ever be quarantined.
+      2. write_quarantine            must run BEFORE sync_error_manifest, so a
+         crash can never leave an open manifest entry whose evidence parquet
+         was never written. Reversed, a crash between the two calls would strand
+         an open entry with no evidence, and the next run's dedupe gate would
+         then drop those rows forever.
+
+    On success sync_error_manifest returns (resolved, readmit): the groups whose
+    valid rows must be re-admitted through PATH A. It raises on failure, so the
+    run aborts instead of continuing with a half-written quarantine.
+
+    Returns (df_error_new, resolved, readmit).
+    """
+    df_error_new = filter_already_quarantined(
+        minio_client, bucket, df_error,
+        manifest_path=manifest_path, grain_col=grain_col, date_col=date_col,
+    )
+    if df_error_new is None:
+        df_error_new = df_error.iloc[0:0]
+
+    if not df_error_new.empty:
+        if dry_run:
+            print(f"[DRY-RUN][{subfolder}] Akan quarantine {len(df_error_new)} bad row(s)")
+        else:
+            write_quarantine(minio_client, bucket, df_error_new, today_key, run_key, subfolder=subfolder)
+    else:
+        print(f"[MINIO][{subfolder}] no NEW bad rows to quarantine")
+
+    resolved, readmit = sync_error_manifest(
+        minio_client, bucket, df_error, v_report, today_key, run_key,
+        subfolder=subfolder, manifest_path=manifest_path, fix_prefix=fix_prefix,
+        date_col=date_col, grain_col=grain_col, df_valid=df_valid, dry_run=dry_run,
+    )
+    return df_error_new, resolved, readmit
 
 
 def run_daily_etl(dry_run: bool | None = None):
@@ -131,7 +203,7 @@ def run_daily_etl(dry_run: bool | None = None):
         "toko": video_status["grain"],
         "gsheet": video_status["sheet_max_tanggal"],
         "wm": video_status["last_processed_date"],
-        "flag": video_status["is_behind"].map({True: "BEHIND", False: "ok"}),
+        "flag": video_status["needs_update"].map({True: "UPDATE", False: "ok"}),
     })
     print("-" * 70)
     print("DATASET: PERFORMA VIDEO (toko grain)")
@@ -150,7 +222,7 @@ def run_daily_etl(dry_run: bool | None = None):
         "akun": produksi_status["grain"],
         "gsheet": produksi_status["sheet_max_tanggal"],
         "wm": produksi_status["last_processed_date"],
-        "flag": produksi_status["is_behind"].map({True: "BEHIND", False: "ok"}),
+        "flag": produksi_status["needs_update"].map({True: "UPDATE", False: "ok"}),
     })
     print("-" * 70)
     print("DATASET: PRODUKSI (akun grain)")
@@ -164,20 +236,20 @@ def run_daily_etl(dry_run: bool | None = None):
     ))
     print()
 
-    n_video_behind = int(video_status["is_behind"].sum()) if len(video_status) else 0
-    n_produksi_behind = int(produksi_status["is_behind"].sum()) if len(produksi_status) else 0
-    n_video_sheets = video_status.groupby("sheet_name")["is_behind"].any()
+    n_video_needing_update = int(video_status["needs_update"].sum()) if len(video_status) else 0
+    n_produksi_needing_update = int(produksi_status["needs_update"].sum()) if len(produksi_status) else 0
+    n_video_sheets = video_status.groupby("sheet_name")["needs_update"].any()
     emit("PRE_FLIGHT", "watermark_monitor", "Watermark drift check complete",
          metrics={
              "video_rows": int(len(video_status)),
-             "video_groups_behind": n_video_behind,
-             "video_sheets_behind": int(n_video_sheets.sum()) if len(n_video_sheets) else 0,
+             "video_groups_needing_update": n_video_needing_update,
+             "video_sheets_needing_update": int(n_video_sheets.sum()) if len(n_video_sheets) else 0,
              "produksi_rows": int(len(produksi_status)),
-             "produksi_behind": n_produksi_behind,
+             "produksi_needing_update": n_produksi_needing_update,
          },
          source=SRC_MINIO)
 
-    video_sheet_passes = video_status.groupby("sheet_name")["is_behind"].any()
+    video_sheet_passes = video_status.groupby("sheet_name")["needs_update"].any()
     all_status = pd.concat([video_status, produksi_status], ignore_index=True)
     has_errors = bool(len(all_status)) and all_status["status"].str.startswith("error").any()
     if has_errors:
@@ -210,13 +282,129 @@ def run_daily_etl(dry_run: bool | None = None):
         return
 
     caught_up = [s for s in video_sheet_passes[~video_sheet_passes].index.tolist() if s not in WHITELIST_SHEETS]
-    behind_sheets_list = video_sheet_passes[video_sheet_passes].index.tolist()
+    sheets_needing_update = video_sheet_passes[video_sheet_passes].index.tolist()
     whitelisted_skipped = [s for s in video_sheet_passes[~video_sheet_passes].index.tolist() if s in WHITELIST_SHEETS]
 
-    if caught_up:
+    print("=" * 70)
+    print("--- PRE-FLIGHT: Quarantine Recovery State ---")
+    print("=" * 70)
+    recovery_state = {}
+    try:
+        for ds_name, manifest_path in QUARANTINE_MANIFEST_PATHS.items():
+            all_open = get_open_error_entries(minio_client, minio_bucket, manifest_path)
+            pending, stuck = _split_recovery_entries(all_open, QUARANTINE_RECOVERY_MAX_AGE_DAYS)
+            recovery_state[ds_name] = {"pending": pending, "stuck": stuck}
+            print(
+                f"[RECOVERY] {ds_name}: {len(pending)} entr(y/ies) pending recovery "
+                f"(<= {QUARANTINE_RECOVERY_MAX_AGE_DAYS}d) | {len(stuck)} STUCK (> {QUARANTINE_RECOVERY_MAX_AGE_DAYS}d)"
+            )
+            for e in pending:
+                print(f"[RECOVERY]   pending: {_recovery_label(e)}")
+            for e in stuck:
+                print(f"[RECOVERY]   STUCK:   {_recovery_label(e)}")
+    except Exception as e:
+        # Fail closed: without the manifest state we cannot know whether repaired
+        # rows are waiting to be re-admitted, so we must not advance.
+        mode = "DRY-RUN WOULD ABORT" if dry_run else "ABORT"
+        print(f"[GATE] {mode} — could not read quarantine recovery state: {e}")
+        emit("GATE", "quarantine_recovery",
+             f"{mode} — could not read quarantine recovery state: {e}",
+             level="ERROR", source=SRC_MINIO)
+        subject, body_html = build_gate_abort_email(
+            gate="2",
+            mode=mode,
+            message=f"Could not read quarantine recovery state: {e}",
+            note="The error manifest must be readable to decide whether repaired rows can be re-admitted.",
+            enable_explanation=not dry_run,
+            bq_updates=BQ_TARGETS,
+        )
+        send_alert_email(subject, body_html, dry_run=dry_run)
+        if log_folder:
+            write_failure_log(log_folder, run_key, f"quarantine recovery state unreadable: {e}")
+        return
+    print()
+
+    emit(
+        "PRE_FLIGHT", "quarantine_recovery", "Quarantine recovery state read",
+        metrics={
+            ds: {
+                "pending": len(v["pending"]),
+                "stuck": len(v["stuck"]),
+                "stuck_detail": [_recovery_label(e) for e in v["stuck"]][:20],
+            }
+            for ds, v in recovery_state.items()
+        },
+        source=SRC_MINIO,
+    )
+
+    video_pending = recovery_state.get("video", {}).get("pending", [])
+    video_stuck = recovery_state.get("video", {}).get("stuck", [])
+    produksi_pending = recovery_state.get("produksi", {}).get("pending", [])
+    produksi_stuck = recovery_state.get("produksi", {}).get("stuck", [])
+
+    if video_stuck:
+        stuck_labels = [_recovery_label(e) for e in video_stuck]
+        mode = "DRY-RUN WOULD ABORT" if dry_run else "ABORT"
+        print(f"[GATE] {mode} — {len(video_stuck)} video quarantine entr(y/ies) past the {QUARANTINE_RECOVERY_MAX_AGE_DAYS}d recovery cap")
+        for lbl in stuck_labels:
+            print(f"[GATE]   STUCK: {lbl}")
+        print("[GATE] These entries can no longer be recovered automatically; fix the source sheet and clear the manifest.")
+        emit(
+            "GATE", "quarantine_recovery",
+            f"{mode} — video quarantine entries past recovery cap: {stuck_labels}",
+            level="ERROR",
+            metrics={
+                "video_stuck": len(video_stuck),
+                "video_stuck_detail": stuck_labels[:20],
+                "video_pending": len(video_pending),
+                "produksi_stuck": len(produksi_stuck),
+            },
+            source=SRC_MINIO,
+        )
+        subject, body_html = build_gate_abort_email(
+            gate="2",
+            mode=mode,
+            message=(
+                f"{len(video_stuck)} video quarantine entr(y/ies) have been unrecovered for more than "
+                f"{QUARANTINE_RECOVERY_MAX_AGE_DAYS} days and can no longer be recovered automatically."
+            ),
+            lists={
+                "video_stuck_entries": stuck_labels[:20],
+                "video_pending_entries": [_recovery_label(e) for e in video_pending][:20],
+                "produksi_stuck_entries": [_recovery_label(e) for e in produksi_stuck][:20],
+            },
+            note=(
+                "Repair the offending source rows (or close the entries in the error manifest). "
+                "Pending recovery entries within the age cap are listed for context only."
+            ),
+            enable_explanation=not dry_run,
+            bq_updates=BQ_TARGETS,
+        )
+        send_alert_email(subject, body_html, dry_run=dry_run)
+        if log_folder:
+            write_wm_log(log_folder, run_key, video_status, produksi_status, video_sheet_passes,
+                         f"ABORT — video quarantine entries past recovery cap ({len(video_stuck)})")
+            write_failure_log(
+                log_folder, run_key,
+                f"video quarantine entries past recovery cap: {stuck_labels}",
+            )
+        return
+
+    if caught_up and video_pending:
+        print(
+            f"[GATE] Video sheets up-to-date, but {len(video_pending)} pending quarantine "
+            f"entr(y/ies) may re-admit repaired rows — gate held OPEN for recovery."
+        )
+        if produksi_pending:
+            print(
+                f"[GATE] {len(produksi_pending)} pending produksi entr(y/ies) reported only "
+                "(produksi never gates)."
+            )
+
+    if caught_up and not video_pending:
         mode = "DRY-RUN WOULD ABORT" if dry_run else "ABORT"
         print(f"[GATE] Video sheets already up-to-date (skipped): {caught_up}")
-        print(f"[GATE] Video sheets with new data: {behind_sheets_list}")
+        print(f"[GATE] Video sheets with new data: {sheets_needing_update}")
         if whitelisted_skipped:
             print(f"[GATE] Whitelisted video sheets up-to-date (not blocking): {whitelisted_skipped}")
         print(f"[GATE] {mode} — video sheets with no new data are required before continuing.")
@@ -224,7 +412,7 @@ def run_daily_etl(dry_run: bool | None = None):
         toko_detail = []
         for sheet_name in caught_up:
             sel = video_status[video_status["sheet_name"] == sheet_name]
-            toko_without_new = sel[~sel["is_behind"]]["grain"].tolist()
+            toko_without_new = sel[~sel["needs_update"]]["grain"].tolist()
             toko_detail.append({"sheet_name": sheet_name,
                                 "toko_without_new_data": toko_without_new})
 
@@ -234,12 +422,12 @@ def run_daily_etl(dry_run: bool | None = None):
             level="ERROR",
             metrics={
                 "caught_up": caught_up,
-                "behind": behind_sheets_list,
+                "sheets_needing_update": sheets_needing_update,
                 "whitelisted_skipped": whitelisted_skipped,
                 "caught_up_detail": toko_detail,
                 "total_groups": int(len(video_status)),
                 "sheets_up_to_date": len(caught_up),
-                "sheets_with_new_data": len(behind_sheets_list),
+                "sheets_needing_update_count": len(sheets_needing_update),
             },
             source=SRC_MINIO,
         )
@@ -252,13 +440,13 @@ def run_daily_etl(dry_run: bool | None = None):
             ),
             lists={
                 "sheets_up_to_date": caught_up,
-                "behind_sheets": behind_sheets_list,
+                "sheets_needing_update": sheets_needing_update,
                 "whitelisted_skipped": whitelisted_skipped,
             },
             note=(
                 "Some video sheets are already up-to-date (watermark >= sheet max). "
                 "Produksi is never gated — only toko-grain video sheets require "
-                ">=1 toko behind. If this is expected (no genuinely new data), no "
+                ">=1 toko needing update. If this is expected (no genuinely new data), no "
                 "action needed; otherwise check the source sheet dates."
             ),
             enable_explanation=not dry_run,
@@ -280,12 +468,17 @@ def run_daily_etl(dry_run: bool | None = None):
     if log_folder:
         video_pass_count = int(video_sheet_passes.sum())
         video_total = len(video_sheet_passes)
-        produksi_behind = int(produksi_status["is_behind"].sum())
+        produksi_needing_update = int(produksi_status["needs_update"].sum())
         produksi_total = len(produksi_status)
         verdict = (
             f"PASS — video: {video_pass_count}/{video_total} sheets, "
-            f"produksi: {produksi_behind}/{produksi_total} akun"
+            f"produksi: {produksi_needing_update}/{produksi_total} akun"
         )
+        if caught_up and video_pending:
+            verdict = (
+                f"PASS (on quarantine recovery only) — {len(caught_up)} video sheet(s) up-to-date, "
+                f"{len(video_pending)} pending recovery entr(y/ies) will re-admit repaired rows"
+            )
         write_wm_log(log_folder, run_key, video_status, produksi_status, video_sheet_passes, verdict)
 
     df_tt_vid_raw = fetch_tiktok_video(gc, spreadsheet_objects)
@@ -389,17 +582,14 @@ def run_daily_etl(dry_run: bool | None = None):
                 f"---> {v_report['last_affected_date']}"
             )
 
-        df_error_new = (
-            filter_already_quarantined(
-                minio_client, minio_bucket, df_error,
-                manifest_path=cfg["manifest_path"], grain_col=cfg["grain_col"],
-            )
-            if not df_error.empty
-            else df_error
+        # Fail-closed order: dedupe -> evidence parquet -> manifest.
+        df_error_new, resolved, readmit = _quarantine_write(
+            minio_client, minio_bucket, df_error, df_valid, v_report,
+            dry_run=dry_run, subfolder=name, date_col=date_col,
+            grain_col=cfg["grain_col"], manifest_path=cfg["manifest_path"],
+            fix_prefix=cfg["fix_prefix"], today_key=today_key, run_key=run_key,
         )
         n_dupes_skipped = max(0, len(df_error) - len(df_error_new))
-
-        resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, subfolder=name, manifest_path=cfg["manifest_path"], fix_prefix=cfg["fix_prefix"], date_col=date_col, df_valid=df_valid, dry_run=dry_run, grain_col=cfg["grain_col"])
 
         if not df_error.empty:
             src_rows = df_error_new if not df_error_new.empty else df_error
@@ -422,8 +612,6 @@ def run_daily_etl(dry_run: bool | None = None):
             if dry_run:
                 print(f"[DRY-RUN][{name}] Akan quarantine {n_quarantined} bad row(s)")
             else:
-                write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key, subfolder=name)
-
                 if log_folder:
                     q_lines = []
                     q_lines.append(f"=== QUARANTINE REPORT — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
@@ -499,36 +687,39 @@ def run_daily_etl(dry_run: bool | None = None):
         )
         dataset_watermarks[name] = watermark_records
 
-        df_recovered = select_recovered(df_valid, resolved, v_report, date_col, grain_col=cfg["grain_col"])
+        df_recovered = select_recovered(
+            df_valid, resolved, v_report, date_col,
+            grain_col=cfg["grain_col"], readmit=readmit,
+        )
         print(
             f"[RECOVERY][{name}] resolved={v_report.get('recovery_resolved', 0)} "
-            f"| recovered_rows={v_report.get('recovery_recovered_rows', 0)} "
-            f"| absent={v_report.get('recovery_absent', 0)} "
-            f"| count_mismatch_skipped={v_report.get('recovery_count_mismatch', 0)}"
+            f"| partial={v_report.get('recovery_partial', 0)} "
+            f"| readmit_rows={v_report.get('recovery_readmit_rows', 0)} "
+            f"| absent={v_report.get('recovery_absent', 0)}"
         )
         emit(
             "RECOVERY", "error_recovery",
             f"[{name}] Recovery: resolved={v_report.get('recovery_resolved', 0)}, "
-            f"recovered_rows={v_report.get('recovery_recovered_rows', 0)}, "
-            f"absent={v_report.get('recovery_absent', 0)}, "
-            f"count_mismatch_skipped={v_report.get('recovery_count_mismatch', 0)}",
-            level="WARN" if v_report.get("recovery_count_mismatch", 0) or v_report.get("recovery_absent", 0) else "INFO",
+            f"partial={v_report.get('recovery_partial', 0)}, "
+            f"readmit_rows={v_report.get('recovery_readmit_rows', 0)}, "
+            f"absent={v_report.get('recovery_absent', 0)}",
+            level="WARN" if v_report.get("recovery_absent", 0) else "INFO",
             metrics={
                 "dataset": name,
                 "resolved": int(v_report.get("recovery_resolved", 0)),
-                "recovered_rows": int(v_report.get("recovery_recovered_rows", 0)),
+                "partial": int(v_report.get("recovery_partial", 0)),
+                "readmit_rows": int(v_report.get("recovery_readmit_rows", 0)),
                 "absent": int(v_report.get("recovery_absent", 0)),
-                "count_mismatch_skipped": int(v_report.get("recovery_count_mismatch", 0)),
             },
             source=src,
             target=tgt_bq,
         )
-        if v_report.get("recovery_recovered_rows", 0) or v_report.get("recovery_resolved", 0):
+        if v_report.get("recovery_readmit_rows", 0) or v_report.get("recovery_resolved", 0):
             subject, body_html = build_recovery_email(
                 resolved=v_report.get("recovery_resolved", 0),
-                recovered_rows=v_report.get("recovery_recovered_rows", 0),
+                recovered_rows=v_report.get("recovery_readmit_rows", 0),
                 absent=v_report.get("recovery_absent", 0),
-                count_mismatch_skipped=v_report.get("recovery_count_mismatch", 0),
+                partial_entries=v_report.get("recovery_partial", 0),
                 dataset_name=name,
                 enable_explanation=not dry_run,
                 bq_updates=BQ_TARGETS,

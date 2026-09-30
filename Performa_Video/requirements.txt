@@ -10,6 +10,5 @@ pyarrow
 numpy
 minio 
 python-dotenv
-google-api-python-client
 tqdm
 google-generativeai

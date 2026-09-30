@@ -1,32 +1,19 @@
 # src/performa_video/utils/notify.py
-"""Email alerting for the ETL pipeline, with interchangeable backends selected
-via NOTIFY_BACKEND:
+"""Email alerting for the ETL pipeline, delivered over SMTP:
 
-  NOTIFY_BACKEND=smtp
     Plain smtplib + a Gmail App Password on a normal consumer Gmail account.
-    Use this when the domain is NOT on Google Workspace (no admin console,
-    only @gmail.com addresses). Setup:
+    No Google Workspace domain and no admin console needed — only a
+    @gmail.com address. Setup:
       1. Enable 2-Step Verification on the sending Gmail account.
       2. Create an App Password: myaccount.google.com/apppasswords
       3. Set NOTIFY_SENDER_EMAIL and NOTIFY_SENDER_APP_PASSWORD.
-    No domain, no admin access, no new external dependency required —
+    No domain, no admin access, no external dependency required —
     smtplib is in the Python standard library.
 
-  NOTIFY_BACKEND=gmail_api  (alternative)
-    Gmail API + domain-wide delegation on the existing service account
-    (the same key used by gsheet/bq clients). Requires a real Google
-    Workspace domain. Setup:
-      1. Enable the Gmail API on the GCP project (database-sigma).
-      2. Workspace Admin Console > Security > API Controls > Domain-wide
-         Delegation, add the service account's OAuth Client ID and scope:
-         https://www.googleapis.com/auth/gmail.send
-      3. Set NOTIFY_IMPERSONATE_EMAIL to a real Workspace mailbox.
-
-Whichever backend is active, send_alert_email() never raises: any setup gap
-or send failure is caught, logged via emit() (see utils/log.py) and returned
-as False, so a broken mail channel can never mask or interrupt the pipeline.
+send_alert_email() never raises: any setup gap or send failure is caught,
+logged via emit() (see utils/log.py) and returned as False, so a broken mail
+channel can never mask or interrupt the pipeline.
 """
-import base64
 import html as _html
 import os
 import smtplib
@@ -41,21 +28,10 @@ from src.performa_video.utils.log import PIPELINE_NAME, emit
 # .env lives at the package root (Performa_Video/.env), three levels up.
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-
-BACKEND = os.getenv("NOTIFY_BACKEND", "gmail_api")  # "smtp" | "gmail_api"
-
 # Master switch. When disabled, send_alert_email() is a silent no-op.
 ENABLED = os.getenv("NOTIFY_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "y",
 }
-
-# --- gmail_api backend config ---
-# Same service-account JSON already used by get_gsheet_client()/get_bq_client().
-SA_KEY_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-# Mailbox the service account impersonates to send mail. Must be a real
-# Workspace user with a mailbox, delegated per the docstring above.
-IMPERSONATE_EMAIL = os.getenv("NOTIFY_IMPERSONATE_EMAIL", "")
 
 # --- smtp backend config ---
 SMTP_HOST = os.getenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
@@ -92,33 +68,6 @@ QUARANTINE_AI_TIMEOUT_S = int(os.getenv("QUARANTINE_AI_TIMEOUT_S", "15"))
 # gemini-3.x flash hides its reasoning inside the token budget, so a small
 # cap truncates the visible explanation — allow room for both.
 QUARANTINE_AI_MAX_TOKENS = int(os.getenv("QUARANTINE_AI_MAX_TOKENS", "1000"))
-
-
-def _send_via_gmail_api(subject: str, body_html: str, to_list: list[str]) -> None:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    if not IMPERSONATE_EMAIL:
-        raise RuntimeError(
-            "NOTIFY_IMPERSONATE_EMAIL is not set — domain-wide delegation "
-            "target mailbox is required before send_alert_email() can run."
-        )
-    if not SA_KEY_PATH or not Path(SA_KEY_PATH).exists():
-        raise RuntimeError(f"Service account key not found at {SA_KEY_PATH!r}")
-
-    creds = service_account.Credentials.from_service_account_file(
-        SA_KEY_PATH, scopes=SCOPES
-    ).with_subject(IMPERSONATE_EMAIL)
-
-    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-    msg = MIMEText(body_html, "html")
-    msg["to"] = ", ".join(to_list)
-    msg["from"] = IMPERSONATE_EMAIL
-    msg["subject"] = subject
-
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def _send_via_smtp(subject: str, body_html: str, to_list: list[str]) -> None:
@@ -171,7 +120,7 @@ def send_alert_email(
     recipients: Iterable[str] | None = None,
     dry_run: bool = False,
 ) -> bool:
-    """Send an HTML alert email via the configured backend (NOTIFY_BACKEND).
+    """Send an HTML alert email over SMTP.
 
     Returns True on success, False on any failure (never raises). No-op
     (True) when notifications are disabled; in dry-run mode the send is
@@ -183,9 +132,9 @@ def send_alert_email(
     to_list = list(recipients) if recipients else DEFAULT_RECIPIENTS
 
     if dry_run:
-        print(f"[notify] DRY RUN ({BACKEND}) — would send to {to_list}: {subject}")
+        print(f"[notify] DRY RUN (smtp) — would send to {to_list}: {subject}")
         emit("NOTIFY", "gmail_notifier",
-             f"DRY-RUN ({BACKEND}) would send alert to {to_list}: {subject}")
+             f"DRY-RUN (smtp) would send alert to {to_list}: {subject}")
         return True
 
     if not to_list:
@@ -195,15 +144,10 @@ def send_alert_email(
         return False
 
     try:
-        if BACKEND == "smtp":
-            _send_via_smtp(subject, body_html, to_list)
-        elif BACKEND == "gmail_api":
-            _send_via_gmail_api(subject, body_html, to_list)
-        else:
-            raise RuntimeError(f"Unknown NOTIFY_BACKEND: {BACKEND!r}")
+        _send_via_smtp(subject, body_html, to_list)
 
-        print(f"[notify] Alert email sent via {BACKEND}: {subject}")
-        emit("NOTIFY", "gmail_notifier", f"Alert email sent via {BACKEND}: {subject}",
+        print(f"[notify] Alert email sent via smtp: {subject}")
+        emit("NOTIFY", "gmail_notifier", f"Alert email sent via smtp: {subject}",
              metrics={"recipients": to_list})
         return True
 
@@ -213,9 +157,7 @@ def send_alert_email(
              f"SMTP error, alert NOT sent: {e}", level="ERROR")
         return False
     except Exception as e:
-        # Covers HttpError from googleapiclient (imported lazily above,
-        # so caught generically here rather than named at module level)
-        # plus any other setup/send failure.
+        # Any other setup/send failure (missing config, auth rejected, ...).
         print(f"[notify] {type(e).__name__}, alert NOT sent: {e}")
         emit("NOTIFY", "gmail_notifier",
              f"{type(e).__name__}, alert NOT sent: {e}", level="ERROR")
@@ -223,42 +165,22 @@ def send_alert_email(
 
 
 def notify_self_check() -> dict:
-    """Report what's configured vs. still missing for the active backend,
+    """Report what's configured vs. still missing for SMTP delivery,
     without sending anything or requiring network access."""
-    checks = {"backend": BACKEND}
+    checks = {
+        "sender email set": bool(SENDER_EMAIL),
+        "app password set": bool(SENDER_APP_PASSWORD),
+        "recipients set": bool(DEFAULT_RECIPIENTS),
+    }
 
-    if BACKEND == "gmail_api":
-        try:
-            import googleapiclient  # noqa: F401
-            checks["dependency installed"] = True
-        except ImportError:
-            checks["dependency installed"] = False
-        checks["key file found"] = bool(SA_KEY_PATH) and Path(SA_KEY_PATH).exists()
-        checks["impersonate email set"] = bool(IMPERSONATE_EMAIL)
-    elif BACKEND == "smtp":
-        checks["sender email set"] = bool(SENDER_EMAIL)
-        checks["app password set"] = bool(SENDER_APP_PASSWORD)
-    else:
-        checks["valid backend"] = False
-
-    checks["recipients set"] = bool(DEFAULT_RECIPIENTS)
-
-    print(f"[notify] Self-check (backend={BACKEND}):")
+    print("[notify] Self-check (backend=smtp):")
     for label, val in checks.items():
-        if label == "backend":
-            continue
         mark = "[OK]" if val else "[MISS]"
         print(f"  {mark} {label}")
 
-    expected_ok = all(v for k, v in checks.items() if k != "backend")
-    if expected_ok:
-        if BACKEND == "gmail_api":
-            print("  All config present. Note: this does NOT confirm domain-wide")
-            print("  delegation is actually granted — that only shows up as an")
-            print("  error on a real (non-dry-run) send attempt.")
-        else:
-            print("  All config present. A real (non-dry-run) send is still the")
-            print("  only way to confirm the App Password is valid.")
+    if all(checks.values()):
+        print("  All config present. A real (non-dry-run) send is still the")
+        print("  only way to confirm the App Password is valid.")
 
     if not ENABLED:
         print("  NOTE: NOTIFY_ENABLED=false — sending is currently a no-op.")
@@ -464,38 +386,16 @@ def build_gate_abort_email(
     )
     return subject, body
 
-QUARANTINE_SAMPLE_COLUMNS = [
-    "sheet_name",
-    "Tanggal",
-    "Toko",
-    "Nama kampanye",
-    "ID Campaign",
-    "ID produk",
-    "Jenis materi iklan",
-    "Judul video",
-    "ID video",
-    "Akun TikTok",
-    "Waktu posting",
-    "Status",
-    "Jenis otorisasi",
-    "Biaya",
-    "Pesanan (SKU)",
-    "Biaya per pesanan",
-    "Pendapatan kotor",
-    "Impresi iklan produk",
-    "Jumlah klik iklan produk",
-    "Tingkat klik iklan produk",
-    "Rasio konversi iklan",
-    "Rasio tayang video iklan 2 detik",
-    "Rasio tayang video iklan 6 detik",
-    "Rasio tayang video iklan 25%",
-    "Rasio tayang video iklan 50%",
-    "Rasio tayang video iklan 75%",
-    "Rasio tayang video iklan 100%",
-    "Mata uang",
-    "ROI",
-    "error_reason"
-]
+QUARANTINE_SAMPLE_COLUMNS: dict[str, list[str]] = {}
+"""No static fallback column list.
+
+This project has per-table GSheet headers that differ in count AND casing
+(video 'Toko'/'ID Video' vs produksi 'AKUN'/'ID KONTEN'), so a single static
+list can never be correct for both. The authoritative per-table lists live in
+utils/quarantine_columns.py and the orchestrator always passes them as
+`columns=`. A missing key here raises rather than silently rendering a table
+with the wrong headers.
+"""
 
 def _resolve_gemini_api_key() -> str:
     """Resolve GEMINI_API_KEY, supporting either a literal key or a path to a
@@ -645,7 +545,7 @@ def explain_recovery(
     resolved: int = 0,
     recovered_rows: int = 0,
     absent: int = 0,
-    count_mismatch_skipped: int = 0,
+    partial_entries: int = 0,
 ) -> str:
     """Best-effort plain-language explanation of an automatic recovery,
     for a non-technical sheet owner."""
@@ -655,10 +555,10 @@ no jargon. Say that previously-broken rows were fixed and re-loaded, in
 Bahasa Indonesia if the context looks Indonesian.
 
 Dataset: {dataset_name or 'unknown'}
-Previously-broken entries now resolved: {resolved}
+Previously-broken entries now fully resolved: {resolved}
+Partially-fixed entries whose valid rows were still re-loaded: {partial_entries}
 Rows re-loaded: {recovered_rows}
 Rows removed from the sheet: {absent}
-Count-mismatch entries skipped: {count_mismatch_skipped}
 
 Write only the explanation, no preamble."""
     return _llm_explain(prompt)
@@ -682,10 +582,11 @@ def build_quarantine_email(
     """Summary email when bad rows are quarantined this run.
 
     `sample_rows` is a list of dicts (source order, at most `sample_size`)
-    rendered as an HTML table. When `columns` is given, it drives BOTH the
-    table headers and the cell lookups (so headers always match the live data
-    keys); any column with no value in the sample is dropped. Without `columns`,
-    the module-level QUARANTINE_SAMPLE_COLUMNS list is used.
+    rendered as an HTML table. `columns` is REQUIRED and drives BOTH the table
+    headers and the cell lookups (so headers always match the live data keys);
+    any column with no value in the sample is dropped. Pass the per-table list
+    from utils/quarantine_columns.py — this project's two tables have different
+    headers in both count and casing, so there is no static default.
     `minio_path` / `log_path` point to the full quarantine data records and
     `n_duplicates_skipped` reports rows that matched an already-open manifest
     group and were not re-quarantined.
@@ -726,7 +627,10 @@ def build_quarantine_email(
                 if any(str(rec.get(c, "")).strip() for rec in sample)
             ]
         else:
-            shown_cols = QUARANTINE_SAMPLE_COLUMNS
+            raise ValueError(
+                "build_quarantine_email requires `columns` — this project has "
+                "per-table headers (see utils/quarantine_columns.py)."
+            )
         if shown_cols:
             headers = "".join(
                 f"<th>{_html.escape(str(c))}</th>" for c in shown_cols
@@ -777,14 +681,17 @@ def build_recovery_email(
     resolved: int = 0,
     recovered_rows: int = 0,
     absent: int = 0,
-    count_mismatch_skipped: int = 0,
+    partial_entries: int = 0,
     dataset_name: str = "",
     enable_explanation: bool = True,
     bq_updates: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Summary email when previously-broken rows are recovered and re-loaded.
-    When `enable_explanation` is true, a best-effort AI plain-language summary
-    is prepended."""
+
+    `resolved` counts groups that are no longer bad at all; `partial_entries`
+    counts groups that are still broken but whose signature changed, so their
+    valid rows were re-admitted too. When `enable_explanation` is true, a
+    best-effort AI plain-language summary is prepended."""
     subject = f"[ETL RECOVERY - {pipeline_name}] {recovered_rows} row(s) recovered"
     parts = []
     if enable_explanation:
@@ -793,7 +700,7 @@ def build_recovery_email(
             resolved=resolved,
             recovered_rows=recovered_rows,
             absent=absent,
-            count_mismatch_skipped=count_mismatch_skipped,
+            partial_entries=partial_entries,
         )
         if explanation:
             parts.append(_explanation_html(explanation))
@@ -801,9 +708,9 @@ def build_recovery_email(
         parts.append(f"<p><b>Dataset:</b> {_html.escape(str(dataset_name))}</p>")
     parts += [
         f"<p><b>Resolved error entries:</b> {resolved}</p>",
+        f"<p><b>Partially-fixed groups re-admitted:</b> {partial_entries}</p>",
         f"<p><b>Rows re-loaded (path A):</b> {recovered_rows}</p>",
         f"<p><b>Absent (rows removed from sheet):</b> {absent}</p>",
-        f"<p><b>Count-mismatch skipped:</b> {count_mismatch_skipped}</p>",
     ]
 
     bq_targets = _render_bq_targets(bq_updates)
